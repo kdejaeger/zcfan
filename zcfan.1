@@ -5,7 +5,11 @@ zcfan - zero-configuration fan control daemon for ThinkPads
 
 .SH DESCRIPTION
 .B zcfan
-is a minimal, zero-configuration fan control daemon for ThinkPads.
+is a minimal, zero-configuration fan control daemon for ThinkPads. It uses
+an arithmetic average of available temperature readings for fan control. When
+CPU-core readings can be identified, only those are averaged; otherwise CPU
+readings are preferred, with a fallback to all readable temperature inputs.
+Unavailable and non-positive readings are ignored.
 
 .SH OPTIONS
 .B zcfan
@@ -51,7 +55,7 @@ If no trip temperature is reached, the fan will be turned off.
 
 We will only reduce the fan level again once:
 .IP "1." 3
-The temperature is now at least
+The average temperature is now at least
 .I temp_hysteresis
 Celsius below the trip point (default 10C), and
 .IP "2." 3

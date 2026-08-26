@@ -25,7 +25,6 @@
 
 #define info(fmt, ...) fprintf(stderr, "[INF] " fmt, ##__VA_ARGS__)
 #define err(fmt, ...) fprintf(stderr, "[ERR] " fmt, ##__VA_ARGS__)
-#define max(x, y) ((x) > (y) ? (x) : (y))
 #define expect(x)                                                              \
     do {                                                                       \
         if (!(x)) {                                                            \
@@ -45,8 +44,19 @@ static size_t num_to_ignore_sensors = 0;
 static size_t num_ignored_sensors = 0;
 
 #define MAX_SENSOR_FDS 4096
-static int sensor_fds[MAX_SENSOR_FDS];
+enum SensorKind {
+    SENSOR_OTHER,
+    SENSOR_CPU,
+    SENSOR_CPU_CORE,
+};
+struct Sensor {
+    int fd;
+    enum SensorKind kind;
+};
+static struct Sensor sensors[MAX_SENSOR_FDS];
 static size_t num_sensor_fds = 0;
+static size_t num_cpu_temp_sensors = 0;
+static size_t num_cpu_core_sensors = 0;
 
 /* Must be highest to lowest temp */
 enum FanLevel { FAN_MAX, FAN_MED, FAN_LOW, FAN_OFF, FAN_INVALID };
@@ -128,17 +138,24 @@ static void fscanf_ignore_sensor(FILE *f, long pos) {
     }
 }
 
+static bool read_sensor_file(DIR *sensor_dir, const char *file_name, char *buf,
+                             size_t buf_size) {
+    int fd = openat(dirfd(sensor_dir), file_name, O_RDONLY);
+    if (fd < 0)
+        return false;
+    ssize_t len = read(fd, buf, buf_size - 1);
+    close(fd);
+    if (len <= 0)
+        return false;
+    buf[len] = '\0';
+    buf[strcspn(buf, "\n")] = '\0';
+    return true;
+}
+
 static bool is_sensor_name_ignored(DIR *sensor_dir) {
-    int name_fd = openat(dirfd(sensor_dir), "name", O_RDONLY);
-    if (name_fd < 0)
-        return false;
     char sensor_name[SENSOR_NAME_MAX];
-    ssize_t name_len = read(name_fd, sensor_name, SENSOR_NAME_MAX - 1);
-    close(name_fd);
-    if (name_len <= 0)
+    if (!read_sensor_file(sensor_dir, "name", sensor_name, sizeof(sensor_name)))
         return false;
-    sensor_name[name_len] = '\0';
-    sensor_name[strcspn(sensor_name, "\n")] = '\0';
     for (size_t i = 0; i < num_to_ignore_sensors; i++) {
         if (strcmp(sensor_name, ignored_sensors_arr[i]) == 0)
             return true;
@@ -164,7 +181,41 @@ static int full_speed_supported(void) {
     return found;
 }
 
-static void add_sensor_fds(DIR *sensor_dir) {
+static bool is_cpu_driver(const char *sensor_name) {
+    return strstr(sensor_name, "cpu") != NULL ||
+           strcmp(sensor_name, "coretemp") == 0 ||
+           strcmp(sensor_name, "k10temp") == 0 ||
+           strcmp(sensor_name, "zenpower") == 0;
+}
+
+static bool is_cpu_label(const char *label) {
+    return strncmp(label, "CPU", strlen("CPU")) == 0 ||
+           strncmp(label, "Package ", strlen("Package ")) == 0 ||
+           strncmp(label, "Physical id ", strlen("Physical id ")) == 0 ||
+           strncmp(label, "Tctl", strlen("Tctl")) == 0 ||
+           strncmp(label, "Tdie", strlen("Tdie")) == 0 ||
+           strncmp(label, "Tccd", strlen("Tccd")) == 0;
+}
+
+static enum SensorKind get_sensor_kind(DIR *sensor_dir,
+                                       const struct dirent *sensor_file,
+                                       bool cpu_driver) {
+    char label_file[NAME_MAX + sizeof("_label")];
+    char label[SENSOR_NAME_MAX];
+    int ret = snprintf(label_file, sizeof(label_file), "%s_label",
+                       sensor_file->d_name);
+    if (ret >= 0 && (size_t)ret < sizeof(label_file) &&
+        read_sensor_file(sensor_dir, label_file, label, sizeof(label))) {
+        if (strncmp(label, "Core ", strlen("Core ")) == 0)
+            return SENSOR_CPU_CORE;
+        if (is_cpu_label(label))
+            return SENSOR_CPU;
+    }
+
+    return cpu_driver ? SENSOR_CPU : SENSOR_OTHER;
+}
+
+static void add_sensor_fds(DIR *sensor_dir, bool cpu_driver) {
     struct dirent *sensor_file;
     while ((sensor_file = readdir(sensor_dir)) != NULL) {
         if (strncmp(sensor_file->d_name, "temp", 4) != 0 ||
@@ -174,7 +225,14 @@ static void add_sensor_fds(DIR *sensor_dir) {
         int temp_fd = openat(dirfd(sensor_dir), sensor_file->d_name, O_RDONLY);
         if (temp_fd < 0)
             continue;
-        sensor_fds[num_sensor_fds++] = temp_fd;
+        enum SensorKind kind =
+            get_sensor_kind(sensor_dir, sensor_file, cpu_driver);
+        sensors[num_sensor_fds++] =
+            (struct Sensor){.fd = temp_fd, .kind = kind};
+        if (kind == SENSOR_CPU_CORE)
+            num_cpu_core_sensors++;
+        if (kind != SENSOR_OTHER)
+            num_cpu_temp_sensors++;
     }
 }
 
@@ -201,12 +259,16 @@ static void populate_sensor_fds(void) {
             close(sensor_dir_fd);
             continue;
         }
+        char sensor_name[SENSOR_NAME_MAX];
+        bool cpu_driver = read_sensor_file(sensor_dir, "name", sensor_name,
+                                           sizeof(sensor_name)) &&
+                          is_cpu_driver(sensor_name);
         if (is_sensor_name_ignored(sensor_dir)) {
             num_ignored_sensors++;
             closedir(sensor_dir);
             continue;
         }
-        add_sensor_fds(sensor_dir);
+        add_sensor_fds(sensor_dir, cpu_driver);
         closedir(sensor_dir);
     }
     closedir(hwmon_dir);
@@ -225,20 +287,33 @@ static int read_temp_fd(int fd) {
     return (sscanf(buf, "%d", &val) == 1) ? val : TEMP_INVALID;
 }
 
-static int get_max_temp(void) {
-    int max_temp = TEMP_INVALID;
+static int get_average_temp(void) {
+    int64_t temp_sum = 0;
+    size_t num_valid_temps = 0;
+    enum SensorKind selected_kind = SENSOR_OTHER;
+    if (num_cpu_core_sensors > 0)
+        selected_kind = SENSOR_CPU_CORE;
+    else if (num_cpu_temp_sensors > 0)
+        selected_kind = SENSOR_CPU;
+
     for (size_t i = 0; i < num_sensor_fds; i++) {
-        int temp = read_temp_fd(sensor_fds[i]);
-        max_temp = max(max_temp, temp);
+        if (selected_kind != SENSOR_OTHER && sensors[i].kind != selected_kind)
+            continue;
+        int temp = read_temp_fd(sensors[i].fd);
+        if (temp == TEMP_INVALID || temp <= 0)
+            continue;
+        temp_sum += temp;
+        num_valid_temps++;
     }
 
-    if (max_temp == TEMP_INVALID) {
+    if (num_valid_temps == 0) {
         err("Couldn't find any valid temperature\n");
         exit_if_first_tick();
         return TEMP_INVALID;
     }
 
-    return MILLIC_TO_C(max_temp);
+    int average_temp = (int)(temp_sum / (int64_t)num_valid_temps);
+    return MILLIC_TO_C(average_temp);
 }
 
 #define write_fan_level(level) write_fan("level", level)
@@ -283,14 +358,14 @@ enum set_fan_status {
 };
 
 static enum set_fan_status set_fan_level(void) {
-    int max_temp = get_max_temp(), temp_penalty = 0;
+    int average_temp = get_average_temp(), temp_penalty = 0;
     static unsigned int tick_penalty = tick_hysteresis;
 
     if (tick_penalty > 0) {
         tick_penalty--;
     }
 
-    if (max_temp == TEMP_INVALID) {
+    if (average_temp == TEMP_INVALID) {
         write_fan_level("full-speed");
         return FAN_LEVEL_INVALID;
     }
@@ -307,12 +382,12 @@ static enum set_fan_status set_fan_level(void) {
         }
 
         if (rule->threshold < temp_penalty ||
-            (rule->threshold - temp_penalty) < max_temp) {
+            (rule->threshold - temp_penalty) < average_temp) {
             if (rule != current_rule) {
                 current_rule = rule;
                 tick_penalty = tick_hysteresis;
-                printf("[FAN] Temperature now %dC, fan set to %s\n", max_temp,
-                       rule->name);
+                printf("[FAN] Average temperature now %dC, fan set to %s\n",
+                       average_temp, rule->name);
                 write_fan_level(rule->tpacpi_level);
                 return FAN_LEVEL_SET;
             }
@@ -417,6 +492,13 @@ static void print_thresholds(void) {
         const struct Rule *rule = rules + i;
         printf("[CFG] At %dC fan is set to %s\n", rule->threshold, rule->name);
     }
+    if (num_cpu_core_sensors > 0) {
+        printf("[CFG] Averaging %zu CPU core sensors\n", num_cpu_core_sensors);
+    } else if (num_cpu_temp_sensors > 0) {
+        printf("[CFG] Averaging %zu CPU sensors\n", num_cpu_temp_sensors);
+    } else {
+        printf("[CFG] Averaging all %zu temperature sensors\n", num_sensor_fds);
+    }
     printf("[CFG] Ignored %zu present sensors based on config\n",
            num_ignored_sensors);
 }
@@ -507,6 +589,6 @@ int main(int argc, char *argv[]) {
         write_watchdog_timeout(0);
     }
     for (size_t i = 0; i < num_sensor_fds; i++) {
-        close(sensor_fds[i]);
+        close(sensors[i].fd);
     }
 }

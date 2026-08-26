@@ -16,8 +16,12 @@ Zero-configuration fan control daemon for ThinkPads.
 
 ## Usage
 
-zcfan reads all temperature sensors present on the system. By default, it has
-the following default fan states:
+zcfan reads the temperature inputs exposed by the system's hwmon drivers and
+uses their arithmetic average for fan control. When identifiable CPU-core
+readings are available, only those readings are averaged. Otherwise, it uses
+CPU-labelled readings (or known CPU temperature drivers), and finally falls
+back to all readable temperature inputs. Unavailable and non-positive readings
+are ignored. By default, it has the following default fan states:
 
 | Config name | thinkpad_acpi fan level           | Default trip temperature (C) |
 |-------------|-----------------------------------|------------------------------|
@@ -27,8 +31,8 @@ the following default fan states:
 
 If no trip temperature is reached, the fan will be turned off.
 
-The fan will also only be reduced once the temperature is now at least 10C
-below the trip temperature for the current fan state. This can be tuned with
+The fan will also only be reduced once the average temperature is now at least
+10C below the trip temperature for the current fan state. This can be tuned with
 the config parameter `temp_hysteresis`.
 
 To override these defaults, you can place a file at `/etc/zcfan.conf` with
@@ -66,8 +70,8 @@ file:
 
 We will only reduce the fan level again once:
 
-1. The temperature is now at least `temp_hysteresis` Celsius (default 10C)
-   below the trip point, and
+1. The average temperature is now at least `temp_hysteresis` Celsius (default
+   10C) below the trip point, and
 2. At least 3 seconds have elapsed since the initial trip.
 
 This avoids unnecessary fluctuations in fan speed.
