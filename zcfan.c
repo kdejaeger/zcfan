@@ -204,8 +204,11 @@ static enum SensorKind get_sensor_kind(DIR *sensor_dir,
                                        bool cpu_driver) {
     char label_file[NAME_MAX + sizeof("_label")];
     char label[SENSOR_NAME_MAX];
-    int ret = snprintf(label_file, sizeof(label_file), "%s_label",
-                       sensor_file->d_name);
+    /* hwmon temp files are tempN_input with a matching tempN_label; strip the
+     * _input suffix before appending _label. */
+    size_t base_len = strlen(sensor_file->d_name) - strlen("_input");
+    int ret = snprintf(label_file, sizeof(label_file), "%.*s_label",
+                       (int)base_len, sensor_file->d_name);
     if (ret >= 0 && (size_t)ret < sizeof(label_file) &&
         read_sensor_file(sensor_dir, label_file, label, sizeof(label))) {
         if (strncmp(label, "Core ", strlen("Core ")) == 0)
