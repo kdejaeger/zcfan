@@ -23,11 +23,11 @@ CPU-labelled readings (or known CPU temperature drivers), and finally falls
 back to all readable temperature inputs. Unavailable and non-positive readings
 are ignored. By default, it has the following default fan states:
 
-| Config name | thinkpad_acpi fan level           | Default trip temperature (C) |
-|-------------|-----------------------------------|------------------------------|
-| max_temp    | full-speed (or 7 if unsupported)  | 90                           |
-| med_temp    | 4                                 | 80                           |
-| low_temp    | 1                                 | 70                           |
+| Config name     | thinkpad_acpi fan level           | Default trip temperature (C) | Default debounce (s) |
+|-----------------|-----------------------------------|------------------------------|----------------------|
+| max_temp        | full-speed (or 7 if unsupported)  | 90                           | 1                    |
+| med_temp        | 4                                 | 80                           | 3                    |
+| low_temp        | 1                                 | 70                           | 5                    |
 
 If no trip temperature is reached, the fan will be turned off.
 
@@ -46,6 +46,15 @@ updated trip temperatures in degrees celsius and/or fan levels. As an example:
     max_level full-speed
     med_level 4
     low_level 1
+
+The number of consecutive seconds the average temperature must stay above a
+level's trip temperature before that level is engaged can be set per level with
+the `max_debounce_secs`, `med_debounce_secs`, and `low_debounce_secs` config
+parameters. A value of `0` or `1` engages the level immediately. For example:
+
+    max_debounce_secs 1
+    med_debounce_secs 3
+    low_debounce_secs 5
 
 ### Ignoring sensors
 
@@ -75,6 +84,14 @@ We will only reduce the fan level again once:
 2. At least 3 seconds have elapsed since the initial trip.
 
 This avoids unnecessary fluctuations in fan speed.
+
+### Debounce
+
+Conversely, before we engage a *higher* fan level, the average temperature must
+remain above that level's trip point for a number of consecutive seconds set by
+`low_debounce_secs`, `med_debounce_secs`, and `max_debounce_secs` (defaults 5, 3,
+and 1). This prevents brief temperature spikes from needlessly spinning the
+fans up. A value of `0` or `1` engages the level immediately.
 
 ## Comparison with thinkfan
 

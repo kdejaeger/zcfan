@@ -28,12 +28,12 @@ has the following default fan states:
 .RS
 .TS
 tab(;);
-l l l.
-Config name;thinkpad_acpi fan level;Default trip temperature (C)
+l l l l.
+Config name;thinkpad_acpi fan level;Default trip temperature (C);Default debounce (s)
 _
-max_temp;7;90
-med_temp;4;80
-low_temp;1;70
+max_temp;7;90;1
+med_temp;4;80;3
+low_temp;1;70;5
 .TE
 .RE
 
@@ -51,6 +51,24 @@ low_temp 55
 
 If no trip temperature is reached, the fan will be turned off.
 
+The number of consecutive seconds the average temperature must stay above a
+level's trip temperature before that level is engaged can be set per level with
+the
+.I max_debounce_secs
+,
+.I med_debounce_secs
+, and
+.I low_debounce_secs
+parameters. A value of 0 or 1 engages the level immediately. For example:
+
+.RS
+.EX
+max_debounce_secs 1
+med_debounce_secs 3
+low_debounce_secs 5
+.EE
+.RE
+
 .SS HYSTERESIS
 
 We will only reduce the fan level again once:
@@ -63,6 +81,18 @@ At least 3 seconds have elapsed since the initial trip.
 .PP
 
 This avoids unnecessary fluctuations in fan speed.
+
+.SS DEBOUNCE
+
+Conversely, before we engage a higher fan level, the average temperature must
+remain above that level's trip point for a number of consecutive seconds set by
+.I low_debounce_secs
+,
+.I med_debounce_secs
+, and
+.I max_debounce_secs
+(defaults 5, 3, and 1). This prevents brief temperature spikes from needlessly
+spinning the fans up. A value of 0 or 1 engages the level immediately.
 
 .SS WATCHDOG
 

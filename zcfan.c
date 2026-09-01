@@ -64,12 +64,13 @@ struct Rule {
     char tpacpi_level[CONFIG_MAX_STRLEN + 1];
     int threshold;
     const char *name;
+    int debounce_secs;
 };
 static struct Rule rules[] = {
-    [FAN_MAX] = {"full-speed", 90, "maximum"},
-    [FAN_MED] = {"4", 80, "medium"},
-    [FAN_LOW] = {"1", 70, "low"},
-    [FAN_OFF] = {"0", TEMP_MIN, "off"},
+    [FAN_MAX] = {"full-speed", 90, "maximum", 1},
+    [FAN_MED] = {"4", 80, "medium", 3},
+    [FAN_LOW] = {"1", 70, "low", 5},
+    [FAN_OFF] = {"0", TEMP_MIN, "off", 0},
 };
 
 static struct timespec last_watchdog_ping = {0, 0};
@@ -78,6 +79,7 @@ static int temp_hysteresis = 10;
 static const unsigned int tick_hysteresis = 3;
 static char output_buf[512];
 static const struct Rule *current_rule = NULL;
+static unsigned int level_ticks[FAN_INVALID];
 static volatile sig_atomic_t run = 1;
 static volatile sig_atomic_t pending_sleep = 0;
 static volatile sig_atomic_t pending_resume = 0;
@@ -371,6 +373,13 @@ static enum set_fan_status set_fan_level(void) {
     }
 
     for (size_t i = 0; i < FAN_INVALID; i++) {
+        if (average_temp > rules[i].threshold)
+            level_ticks[i]++;
+        else
+            level_ticks[i] = 0;
+    }
+
+    for (size_t i = 0; i < FAN_INVALID; i++) {
         const struct Rule *rule = rules + i;
 
         if (rule == current_rule) {
@@ -384,6 +393,13 @@ static enum set_fan_status set_fan_level(void) {
         if (rule->threshold < temp_penalty ||
             (rule->threshold - temp_penalty) < average_temp) {
             if (rule != current_rule) {
+                bool moving_up = current_rule == NULL || rule < current_rule;
+                if (moving_up &&
+                    level_ticks[i] < (unsigned int)rule->debounce_secs) {
+                    // Must stay above the threshold for debounce_secs before
+                    // engaging a higher fan level
+                    return FAN_LEVEL_NOT_SET;
+                }
                 current_rule = rule;
                 tick_penalty = tick_hysteresis;
                 printf("[FAN] Average temperature now %dC, fan set to %s\n",
@@ -464,6 +480,12 @@ static void get_config(void) {
         fscanf_int_for_key(f, pos, "max_temp", rules[FAN_MAX].threshold);
         fscanf_int_for_key(f, pos, "med_temp", rules[FAN_MED].threshold);
         fscanf_int_for_key(f, pos, "low_temp", rules[FAN_LOW].threshold);
+        fscanf_int_for_key(f, pos, "max_debounce_secs",
+                           rules[FAN_MAX].debounce_secs);
+        fscanf_int_for_key(f, pos, "med_debounce_secs",
+                           rules[FAN_MED].debounce_secs);
+        fscanf_int_for_key(f, pos, "low_debounce_secs",
+                           rules[FAN_LOW].debounce_secs);
         fscanf_int_for_key(f, pos, "watchdog_secs", watchdog_secs);
         fscanf_int_for_key(f, pos, "temp_hysteresis", temp_hysteresis);
         fscanf_str_for_key(f, pos, "max_level", rules[FAN_MAX].tpacpi_level);
@@ -473,6 +495,11 @@ static void get_config(void) {
         if (ftell(f) == pos) {
             while ((ch = fgetc(f)) != EOF && ch != '\n') {}
         }
+    }
+
+    for (size_t i = 0; i < FAN_OFF; i++) {
+        if (rules[i].debounce_secs < 0)
+            rules[i].debounce_secs = 0;
     }
 
     /* Maximum value handled by the kernel is 120, and
@@ -490,7 +517,8 @@ static void get_config(void) {
 static void print_thresholds(void) {
     for (size_t i = 0; i < FAN_OFF; i++) {
         const struct Rule *rule = rules + i;
-        printf("[CFG] At %dC fan is set to %s\n", rule->threshold, rule->name);
+        printf("[CFG] At %dC fan is set to %s (after %ds above threshold)\n",
+               rule->threshold, rule->name, rule->debounce_secs);
     }
     if (num_cpu_core_sensors > 0) {
         printf("[CFG] Averaging %zu CPU core sensors\n", num_cpu_core_sensors);
