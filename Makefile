@@ -15,8 +15,13 @@ SERVICE=zcfan.service
 
 all: $(EXECUTABLES) $(SERVICE)
 
-$(SERVICE): $(SERVICE_TEMPLATE)
+$(SERVICE): $(SERVICE_TEMPLATE) FORCE
 	sed 's|@bindir@|$(bindir)|g' $< > $@
+
+# The generated service embeds $(bindir); always regenerate it so a stale
+# file from a differently-configured build can never be installed.
+.PHONY: FORCE
+FORCE:
 
 %: %.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LIBS) $(LDFLAGS)
