@@ -17,6 +17,7 @@ jobs:
       - run: make lint
       - run: make clean clang-tidy
       - run: make clean clang-everything
+      - run: make check
 
 on:
   push:

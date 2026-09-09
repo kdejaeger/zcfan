@@ -55,5 +55,11 @@ install: all
 lint:
 	clang-format -style=file --dry-run --Werror zcfan.c
 
+check: tests/test-runner
+	./tests/test-runner
+
+tests/test-runner: tests/test.c zcfan.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test.c -o $@ $(LIBS) $(LDFLAGS)
+
 clean:
-	rm -f $(EXECUTABLES) $(SERVICE)
+	rm -f $(EXECUTABLES) $(SERVICE) tests/test-runner

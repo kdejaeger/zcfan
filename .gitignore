@@ -1,4 +1,5 @@
 zcfan
 zcfan.service
+tests/test-runner
 .idea
 .pi
