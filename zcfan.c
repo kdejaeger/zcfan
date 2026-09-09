@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -41,9 +42,10 @@
 #define SENSOR_NAME_MAX 256
 static char ignored_sensors_arr[MAX_IGNORED_SENSORS][SENSOR_NAME_MAX];
 static size_t num_to_ignore_sensors = 0;
-static size_t num_ignored_sensors = 0;
 
 #define MAX_SENSOR_FDS 4096
+/* Relative to /sys/class/hwmon: "hwmon4294967295/temp2147483647_input" fits */
+#define SENSOR_PATH_MAX 48
 enum SensorKind {
     SENSOR_OTHER,
     SENSOR_CPU,
@@ -52,11 +54,29 @@ enum SensorKind {
 struct Sensor {
     int fd;
     enum SensorKind kind;
+    char path[SENSOR_PATH_MAX];
+    /* Identity (from fstat) of the opened attribute file: catches a driver
+     * re-registering at the same hwmonN path, where path and kind alone
+     * would not reveal that the old fds turned stale. */
+    dev_t dev;
+    ino_t ino;
 };
-static struct Sensor sensors[MAX_SENSOR_FDS];
-static size_t num_sensor_fds = 0;
-static size_t num_cpu_temp_sensors = 0;
-static size_t num_cpu_core_sensors = 0;
+struct SensorSet {
+    struct Sensor sensors[MAX_SENSOR_FDS];
+    size_t num_sensor_fds;
+    size_t num_cpu_temp_sensors;
+    size_t num_cpu_core_sensors;
+    size_t num_ignored_sensors;
+    /* False when the scan could not be completed (failed open, readdir
+     * error, overflow); such a snapshot must not replace the active set. A
+     * persistently failing sensor therefore pins the active set: its stale
+     * fd either still reads or is excluded as invalid, so this is safe. */
+    bool complete;
+};
+static struct SensorSet sensor_set;
+static struct SensorSet sensor_set_scratch;
+/* Overridable so tests can run against a synthetic hwmon tree. */
+static const char *hwmon_root = "/sys/class/hwmon";
 
 /* Must be highest to lowest temp */
 enum FanLevel { FAN_MAX, FAN_MED, FAN_LOW, FAN_OFF, FAN_INVALID };
@@ -220,63 +240,192 @@ static enum SensorKind get_sensor_kind(DIR *sensor_dir,
     return cpu_driver ? SENSOR_CPU : SENSOR_OTHER;
 }
 
-static void add_sensor_fds(DIR *sensor_dir, bool cpu_driver) {
-    struct dirent *sensor_file;
-    while ((sensor_file = readdir(sensor_dir)) != NULL) {
-        if (strncmp(sensor_file->d_name, "temp", 4) != 0 ||
-            !strstr(sensor_file->d_name, "_input"))
-            continue;
-        expect(num_sensor_fds < MAX_SENSOR_FDS);
-        int temp_fd = openat(dirfd(sensor_dir), sensor_file->d_name, O_RDONLY);
-        if (temp_fd < 0)
-            continue;
-        enum SensorKind kind =
-            get_sensor_kind(sensor_dir, sensor_file, cpu_driver);
-        sensors[num_sensor_fds++] =
-            (struct Sensor){.fd = temp_fd, .kind = kind};
-        if (kind == SENSOR_CPU_CORE)
-            num_cpu_core_sensors++;
-        if (kind != SENSOR_OTHER)
-            num_cpu_temp_sensors++;
+/* Repeated identical scan failures are logged only on the first occurrence
+ * (or when the failing stage or errno changes), so a persistent failure does
+ * not write a journal line every second. */
+static void log_scan_failure(const char *stage, int failure_errno) {
+    static const char *last_stage;
+    static int last_errno;
+    if (last_stage != stage || last_errno != failure_errno) {
+        err("hwmon scan %s failed: %s\n", stage, strerror(failure_errno));
+        last_stage = stage;
+        last_errno = failure_errno;
     }
 }
 
-static void populate_sensor_fds(void) {
-    int hwmon_fd = open("/sys/class/hwmon", O_RDONLY | O_DIRECTORY);
+/* Handle a single tempN_input entry from a hwmon device directory. */
+static void add_sensor_fd(struct SensorSet *set, DIR *sensor_dir,
+                          const char *hwmon_name, bool cpu_driver,
+                          const struct dirent *sensor_file) {
+    if (strncmp(sensor_file->d_name, "temp", 4) != 0 ||
+        !strstr(sensor_file->d_name, "_input"))
+        return;
+    if (set->num_sensor_fds >= MAX_SENSOR_FDS) {
+        /* Rather than aborting a running daemon, treat the scan as
+         * unusable; the active set is kept instead. */
+        set->complete = false;
+        return;
+    }
+    int temp_fd = openat(dirfd(sensor_dir), sensor_file->d_name, O_RDONLY);
+    if (temp_fd < 0) {
+        /* The device may have gone away mid-scan. */
+        set->complete = false;
+        return;
+    }
+    struct stat st;
+    if (fstat(temp_fd, &st) < 0) {
+        close(temp_fd);
+        set->complete = false;
+        return;
+    }
+    enum SensorKind kind = get_sensor_kind(sensor_dir, sensor_file, cpu_driver);
+    struct Sensor *sensor = set->sensors + set->num_sensor_fds++;
+    *sensor = (struct Sensor){
+        .fd = temp_fd, .kind = kind, .dev = st.st_dev, .ino = st.st_ino};
+    int ret = snprintf(sensor->path, sizeof(sensor->path), "%s/%s", hwmon_name,
+                       sensor_file->d_name);
+    expect(ret >= 0 && (size_t)ret < sizeof(sensor->path));
+    if (kind == SENSOR_CPU_CORE)
+        set->num_cpu_core_sensors++;
+    if (kind != SENSOR_OTHER)
+        set->num_cpu_temp_sensors++;
+}
+
+static void add_sensor_fds(struct SensorSet *set, DIR *sensor_dir,
+                           const char *hwmon_name, bool cpu_driver) {
+    for (;;) {
+        errno = 0;
+        struct dirent *sensor_file = readdir(sensor_dir);
+        if (!sensor_file) {
+            if (errno != 0) {
+                /* An I/O error here means entries after this point were
+                 * not seen: the scan is partial. */
+                log_scan_failure("readdir", errno);
+                set->complete = false;
+            }
+            break;
+        }
+        add_sensor_fd(set, sensor_dir, hwmon_name, cpu_driver, sensor_file);
+    }
+}
+
+static int compare_sensor(const void *a, const void *b) {
+    return strcmp(((const struct Sensor *)a)->path,
+                  ((const struct Sensor *)b)->path);
+}
+
+static void scan_hwmon_dir(struct SensorSet *set, DIR *hwmon_dir,
+                           const struct dirent *hwmon_entry) {
+    int sensor_dir_fd =
+        openat(dirfd(hwmon_dir), hwmon_entry->d_name, O_RDONLY | O_DIRECTORY);
+    if (sensor_dir_fd < 0) {
+        /* The device may have gone away mid-scan. */
+        set->complete = false;
+        return;
+    }
+    DIR *sensor_dir = fdopendir(sensor_dir_fd);
+    if (!sensor_dir) {
+        close(sensor_dir_fd);
+        set->complete = false;
+        return;
+    }
+    char sensor_name[SENSOR_NAME_MAX];
+    bool cpu_driver = read_sensor_file(sensor_dir, "name", sensor_name,
+                                       sizeof(sensor_name)) &&
+                      is_cpu_driver(sensor_name);
+    if (is_sensor_name_ignored(sensor_dir)) {
+        set->num_ignored_sensors++;
+        closedir(sensor_dir);
+        return;
+    }
+    add_sensor_fds(set, sensor_dir, hwmon_entry->d_name, cpu_driver);
+    closedir(sensor_dir);
+}
+
+/* Scan hwmon_root into set. Returns true only when the scan completed and
+ * the snapshot is usable; callers must not swap in a set from a failed or
+ * partial scan. On first-tick failures this exits via exit_if_first_tick(). */
+static bool populate_sensor_fds(struct SensorSet *set) {
+    memset(set, 0, sizeof(*set));
+    set->complete = true;
+
+    int hwmon_fd = open(hwmon_root, O_RDONLY | O_DIRECTORY);
     if (hwmon_fd < 0) {
-        err("open(/sys/class/hwmon): %s\n", strerror(errno));
+        log_scan_failure("open", errno);
         exit_if_first_tick();
+        return false;
     }
     DIR *hwmon_dir = fdopendir(hwmon_fd);
     if (!hwmon_dir) {
-        err("fdopendir(/sys/class/hwmon): %s\n", strerror(errno));
+        log_scan_failure("fdopendir", errno);
+        close(hwmon_fd);
         exit_if_first_tick();
+        return false;
     }
 
-    struct dirent *hwmon_entry;
-    while ((hwmon_entry = readdir(hwmon_dir)) != NULL) {
-        int sensor_dir_fd = openat(dirfd(hwmon_dir), hwmon_entry->d_name,
-                                   O_RDONLY | O_DIRECTORY);
-        if (sensor_dir_fd < 0)
-            continue;
-        DIR *sensor_dir = fdopendir(sensor_dir_fd);
-        if (!sensor_dir) {
-            close(sensor_dir_fd);
-            continue;
+    for (;;) {
+        errno = 0;
+        struct dirent *hwmon_entry = readdir(hwmon_dir);
+        if (!hwmon_entry) {
+            if (errno != 0) {
+                log_scan_failure("readdir", errno);
+                set->complete = false;
+            }
+            break;
         }
-        char sensor_name[SENSOR_NAME_MAX];
-        bool cpu_driver = read_sensor_file(sensor_dir, "name", sensor_name,
-                                           sizeof(sensor_name)) &&
-                          is_cpu_driver(sensor_name);
-        if (is_sensor_name_ignored(sensor_dir)) {
-            num_ignored_sensors++;
-            closedir(sensor_dir);
-            continue;
-        }
-        add_sensor_fds(sensor_dir, cpu_driver);
-        closedir(sensor_dir);
+        scan_hwmon_dir(set, hwmon_dir, hwmon_entry);
     }
     closedir(hwmon_dir);
+
+    /* readdir() order is not guaranteed to be stable between scans, so sort by
+     * path to make sensor set comparison deterministic. */
+    qsort(set->sensors, set->num_sensor_fds, sizeof(struct Sensor),
+          compare_sensor);
+    return set->complete;
+}
+
+static void close_sensor_fds(struct SensorSet *set) {
+    for (size_t i = 0; i < set->num_sensor_fds; i++) {
+        close(set->sensors[i].fd);
+    }
+}
+
+/* True when the two sensor sets are not element-wise identical. The per-kind
+ * counters are derived from the sensor list, so comparing the count and the
+ * per-sensor identity is sufficient. */
+static bool sensor_sets_differ(const struct SensorSet *a,
+                               const struct SensorSet *b) {
+    if (a->num_sensor_fds != b->num_sensor_fds)
+        return true;
+    for (size_t i = 0; i < a->num_sensor_fds; i++) {
+        if (a->sensors[i].kind != b->sensors[i].kind ||
+            a->sensors[i].dev != b->sensors[i].dev ||
+            a->sensors[i].ino != b->sensors[i].ino ||
+            strcmp(a->sensors[i].path, b->sensors[i].path) != 0)
+            return true;
+    }
+    return false;
+}
+
+/* Some hwmon drivers register late: for example, coretemp is autoloaded by
+ * udev and can appear well after we have started. Re-scan every tick and swap
+ * in the new set when it differs from the active one. */
+static void refresh_sensors(void) {
+    struct SensorSet *cur = &sensor_set;
+    struct SensorSet *scratch = &sensor_set_scratch;
+
+    if (populate_sensor_fds(scratch) && sensor_sets_differ(scratch, cur)) {
+        close_sensor_fds(cur);
+        *cur = *scratch;
+        info(
+            "Sensor set changed: %zu sensors (%zu CPU core, %zu non-core CPU)\n",
+            cur->num_sensor_fds, cur->num_cpu_core_sensors,
+            cur->num_cpu_temp_sensors - cur->num_cpu_core_sensors);
+    } else {
+        /* Failed or partial scan, or nothing changed: discard the scratch
+         * set and keep the active one. */
+        close_sensor_fds(scratch);
+    }
 }
 
 /* The kernel supports reading new values without reopening the FD */
@@ -296,15 +445,16 @@ static int get_average_temp(void) {
     int64_t temp_sum = 0;
     size_t num_valid_temps = 0;
     enum SensorKind selected_kind = SENSOR_OTHER;
-    if (num_cpu_core_sensors > 0)
+    if (sensor_set.num_cpu_core_sensors > 0)
         selected_kind = SENSOR_CPU_CORE;
-    else if (num_cpu_temp_sensors > 0)
+    else if (sensor_set.num_cpu_temp_sensors > 0)
         selected_kind = SENSOR_CPU;
 
-    for (size_t i = 0; i < num_sensor_fds; i++) {
-        if (selected_kind != SENSOR_OTHER && sensors[i].kind != selected_kind)
+    for (size_t i = 0; i < sensor_set.num_sensor_fds; i++) {
+        if (selected_kind != SENSOR_OTHER &&
+            sensor_set.sensors[i].kind != selected_kind)
             continue;
-        int temp = read_temp_fd(sensors[i].fd);
+        int temp = read_temp_fd(sensor_set.sensors[i].fd);
         if (temp == TEMP_INVALID || temp <= 0)
             continue;
         temp_sum += temp;
@@ -523,15 +673,18 @@ static void print_thresholds(void) {
         printf("[CFG] At %dC fan is set to %s (after %ds above threshold)\n",
                rule->threshold, rule->name, rule->debounce_secs);
     }
-    if (num_cpu_core_sensors > 0) {
-        printf("[CFG] Averaging %zu CPU core sensors\n", num_cpu_core_sensors);
-    } else if (num_cpu_temp_sensors > 0) {
-        printf("[CFG] Averaging %zu CPU sensors\n", num_cpu_temp_sensors);
+    if (sensor_set.num_cpu_core_sensors > 0) {
+        printf("[CFG] Averaging %zu CPU core sensors\n",
+               sensor_set.num_cpu_core_sensors);
+    } else if (sensor_set.num_cpu_temp_sensors > 0) {
+        printf("[CFG] Averaging %zu CPU sensors\n",
+               sensor_set.num_cpu_temp_sensors);
     } else {
-        printf("[CFG] Averaging all %zu temperature sensors\n", num_sensor_fds);
+        printf("[CFG] Averaging all %zu temperature sensors\n",
+               sensor_set.num_sensor_fds);
     }
     printf("[CFG] Ignored %zu present sensors based on config\n",
-           num_ignored_sensors);
+           sensor_set.num_ignored_sensors);
 }
 
 static void stop(int sig) {
@@ -582,12 +735,18 @@ int main(int argc, char *argv[]) {
     }
 
     write_watchdog_timeout(watchdog_secs);
-    populate_sensor_fds();
+    if (!populate_sensor_fds(&sensor_set)) {
+        /* First-tick open failures exit inside the scan; anything else that
+         * lands here (readdir error, sensor count overflow) means we could
+         * not obtain a trustworthy sensor list. */
+        return 1;
+    }
     print_thresholds();
 
     int fan_control_enabled = 1;
 
     while (run) {
+        refresh_sensors();
         if (fan_control_enabled) {
             enum set_fan_status set = set_fan_level();
             if (set != FAN_LEVEL_SET) {
@@ -619,7 +778,6 @@ int main(int argc, char *argv[]) {
     if (write_fan_level("auto") == 0) {
         write_watchdog_timeout(0);
     }
-    for (size_t i = 0; i < num_sensor_fds; i++) {
-        close(sensors[i].fd);
-    }
+    close_sensor_fds(&sensor_set);
+    return 0;
 }
