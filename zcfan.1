@@ -9,7 +9,12 @@ is a minimal, zero-configuration fan control daemon for ThinkPads. It uses
 an arithmetic average of available temperature readings for fan control. When
 CPU-core readings can be identified, only those are averaged; otherwise CPU
 readings are preferred, with a fallback to all readable temperature inputs.
-Unavailable and non-positive readings are ignored.
+Unavailable and non-positive readings are ignored. The set of readable,
+non-ignored temperature inputs is re-checked roughly once per second, so hwmon
+drivers that register after
+.B zcfan
+has started (for example, coretemp being autoloaded by udev during boot) are
+picked up automatically.
 
 .SH OPTIONS
 .B zcfan
@@ -31,9 +36,9 @@ tab(;);
 l l l l.
 Config name;thinkpad_acpi fan level;Default trip temperature (C);Default debounce (s)
 _
-max_temp;7;90;1
-med_temp;4;80;3
-low_temp;1;70;5
+max_temp;full-speed;90;10
+med_temp;4;80;30
+low_temp;1;70;60
 .TE
 .RE
 
@@ -75,7 +80,7 @@ We will only reduce the fan level again once:
 .IP "1." 3
 The average temperature is now at least
 .I temp_hysteresis
-Celsius below the trip point (default 10C), and
+Celsius below the trip point (default 20C), and
 .IP "2." 3
 At least 3 seconds have elapsed since the initial trip.
 .PP
@@ -91,7 +96,7 @@ remain above that level's trip point for a number of consecutive seconds set by
 .I med_debounce_secs
 , and
 .I max_debounce_secs
-(defaults 5, 3, and 1). This prevents brief temperature spikes from needlessly
+(defaults 60, 30, and 10). This prevents brief temperature spikes from needlessly
 spinning the fans up. A value of 0 or 1 engages the level immediately.
 
 .SS WATCHDOG
