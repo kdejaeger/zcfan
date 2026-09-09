@@ -87,15 +87,15 @@ struct Rule {
     int debounce_secs;
 };
 static struct Rule rules[] = {
-    [FAN_MAX] = {"full-speed", 90, "maximum", 1},
-    [FAN_MED] = {"4", 80, "medium", 3},
-    [FAN_LOW] = {"1", 70, "low", 5},
+    [FAN_MAX] = {"full-speed", 90, "maximum", 10},
+    [FAN_MED] = {"4", 80, "medium", 30},
+    [FAN_LOW] = {"1", 70, "low", 60},
     [FAN_OFF] = {"0", TEMP_MIN, "off", 0},
 };
 
 static struct timespec last_watchdog_ping = {0, 0};
 static time_t watchdog_secs = DEFAULT_WATCHDOG_SECS;
-static int temp_hysteresis = 10;
+static int temp_hysteresis = 20;
 static const unsigned int tick_hysteresis = 3;
 static char output_buf[512];
 static const struct Rule *current_rule = NULL;
