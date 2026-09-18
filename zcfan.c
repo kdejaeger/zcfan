@@ -48,7 +48,10 @@ static size_t num_to_ignore_sensors = 0;
 #define SENSOR_PATH_MAX 48
 enum SensorKind {
     SENSOR_OTHER,
+    /* The ACPI/EC CPU-level reading: what the platform's critical-shutdown
+     * trip reacts to; tracked for the fan-control maximum. */
     SENSOR_CPU,
+    /* Per-core die readings: averaged for the fan-control baseline. */
     SENSOR_CPU_CORE,
 };
 struct Sensor {
@@ -210,13 +213,22 @@ static bool is_cpu_driver(const char *sensor_name) {
            strcmp(sensor_name, "zenpower") == 0;
 }
 
-static bool is_cpu_label(const char *label) {
-    return strncmp(label, "CPU", strlen("CPU")) == 0 ||
-           strncmp(label, "Package ", strlen("Package ")) == 0 ||
+/* Die/package readings (coretemp "Package id N"/"Physical id N", k10temp
+ * "Tctl"/"Tdie"/"Tccd") react faster and hotter than the ACPI/EC sensor, so
+ * they are deliberately excluded from fan control: letting them drive the
+ * control temperature made the fan thrash on bursty load. */
+static bool is_die_label(const char *label) {
+    return strncmp(label, "Package ", strlen("Package ")) == 0 ||
            strncmp(label, "Physical id ", strlen("Physical id ")) == 0 ||
            strncmp(label, "Tctl", strlen("Tctl")) == 0 ||
            strncmp(label, "Tdie", strlen("Tdie")) == 0 ||
            strncmp(label, "Tccd", strlen("Tccd")) == 0;
+}
+
+/* The ACPI/EC CPU-level reading (label "CPU" on the thinkpad EC): the same
+ * value the platform's critical-shutdown trip reacts to. */
+static bool is_cpu_label(const char *label) {
+    return strncmp(label, "CPU", strlen("CPU")) == 0;
 }
 
 static enum SensorKind get_sensor_kind(DIR *sensor_dir,
@@ -233,6 +245,8 @@ static enum SensorKind get_sensor_kind(DIR *sensor_dir,
         read_sensor_file(sensor_dir, label_file, label, sizeof(label))) {
         if (strncmp(label, "Core ", strlen("Core ")) == 0)
             return SENSOR_CPU_CORE;
+        if (is_die_label(label))
+            return SENSOR_OTHER;
         if (is_cpu_label(label))
             return SENSOR_CPU;
     }
@@ -455,8 +469,10 @@ static int get_average_temp(void) {
         int temp = read_temp_fd(sensor_set.sensors[i].fd);
         if (temp == TEMP_INVALID || temp <= 0)
             continue;
-        /* Track the hottest CPU-level (package/EC) reading, e.g. the ACPI
-         * sensor that feeds the firmware's critical shutdown trip. */
+        /* Track the ACPI/EC sensor reading: the one the platform's
+         * critical-shutdown trip reacts to. Die/package readings are
+         * excluded (see is_die_label): they spike hotter and faster than
+         * the trip sensor. */
         if (sensor_set.sensors[i].kind == SENSOR_CPU && temp > cpu_max)
             cpu_max = temp;
         if (selected_kind != SENSOR_OTHER &&
@@ -473,7 +489,7 @@ static int get_average_temp(void) {
     }
 
     /* Fan-control temperature: the maximum of the core average and the
-     * hottest CPU-level sensor reading. */
+     * ACPI/EC sensor reading. */
     int average_temp = TEMP_INVALID;
     if (num_valid_temps > 0)
         average_temp = MILLIC_TO_C((int)(temp_sum / (int64_t)num_valid_temps));

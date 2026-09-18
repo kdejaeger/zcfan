@@ -25,9 +25,10 @@ are ignored. The set of readable, non-ignored temperature inputs is re-checked
 roughly once per second, so hwmon drivers that register after zcfan has started
 (for example, coretemp being autoloaded by udev during boot) are picked up
 automatically. The fan-control temperature is the maximum of the core average
-and the hottest CPU-level reading (typically the ACPI/EC sensor, which the
-firmware's critical shutdown trip reacts to). zcfan has the following default
-fan states:
+and the ACPI/EC sensor reading (the same reading the firmware's critical
+shutdown trip reacts to). Die/package sensor readings are deliberately
+excluded: they spike hotter and faster than the trip sensor. zcfan has the
+following default fan states:
 
 | Config name     | thinkpad_acpi fan level           | Default trip temperature (C) | Default debounce (s) |
 |-----------------|-----------------------------------|------------------------------|----------------------|

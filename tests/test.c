@@ -118,10 +118,11 @@ int main(void) {
     CHECK(populate_sensor_fds(&sensor_set));
     CHECK(sensor_set.num_sensor_fds == 7);
     CHECK(sensor_set.num_cpu_core_sensors == 3);
-    CHECK(sensor_set.num_cpu_temp_sensors == 5);
+    CHECK(sensor_set.num_cpu_temp_sensors == 4);
     CHECK(sensor_set.num_ignored_sensors == 0);
     CHECK(sensor_for_path("hwmon0/temp2_input")->kind == SENSOR_CPU_CORE);
-    CHECK(sensor_for_path("hwmon0/temp1_input")->kind == SENSOR_CPU);
+    CHECK(sensor_for_path("hwmon0/temp1_input")->kind ==
+          SENSOR_OTHER); /* die/package reading: excluded from control */
     CHECK(sensor_for_path("hwmon1/temp1_input")->kind == SENSOR_CPU);
     CHECK(sensor_for_path("hwmon2/temp1_input")->kind == SENSOR_OTHER);
     for (size_t i = 1; i < sensor_set.num_sensor_fds; i++) {
@@ -217,18 +218,25 @@ int main(void) {
     CHECK(get_average_temp() == 68);
 
     /* The effective temperature is the maximum of the core average and the
-     * hottest CPU-level (package/EC) reading: that reading leads the core
-     * average and is what the firmware's critical trip reacts to. */
+     * ACPI/EC sensor reading: that sensor is what the firmware's critical
+     * shutdown trip reacts to. */
     expect(snprintf(path, sizeof(path), "%s/hwmon1/temp1_input", fixture_root) >
            0);
     write_file(path, "95000");
-    CHECK(get_average_temp() == 95); /* hottest CPU-level reading wins */
+    CHECK(get_average_temp() == 95); /* ACPI/EC sensor wins over the average */
     write_file(path, "60000");
-    CHECK(get_average_temp() == 68); /* 68C average beats 60C CPU-level */
+    CHECK(get_average_temp() == 68); /* 68C average beats 60C ACPI/EC */
+
+    /* A die/package spike must not move the control temperature: hwmon0's
+     * "Package id 0" is deliberately excluded from fan control. */
+    expect(snprintf(path, sizeof(path), "%s/hwmon0/temp1_input", fixture_root) >
+           0);
+    write_file(path, "99000");
+    CHECK(get_average_temp() == 68); /* die reading ignored */
 
     /* Every hwmon0 reading invalid (0) leaves num_valid_temps == 0 while
-     * cores are still selected: the hottest CPU-level sensor (60000) must
-     * be returned via the cpu_max path instead of erroring. */
+     * cores are still selected: the ACPI/EC sensor (60000) must be
+     * returned via the cpu_max path instead of erroring. */
     expect(snprintf(path, sizeof(path), "%s/hwmon0/temp1_input", fixture_root) >
            0);
     write_file(path, "0");
@@ -241,7 +249,7 @@ int main(void) {
     expect(snprintf(path, sizeof(path), "%s/hwmon0/temp4_input", fixture_root) >
            0);
     write_file(path, "0");
-    CHECK(get_average_temp() == 60); /* hwmon1's CPU sensor survives */
+    CHECK(get_average_temp() == 60); /* hwmon1's ACPI/EC sensor survives */
 
     /* The 95C panic path engages maximum immediately, bypassing debounce:
      * from FAN_OFF with no debounce ticks accrued, the level still moves.
