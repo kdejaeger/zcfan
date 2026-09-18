@@ -261,6 +261,12 @@ int main(void) {
     CHECK(set_fan_level() == FAN_LEVEL_SET);
     CHECK(current_rule == rules + FAN_MAX);
 
+    /* A NULL current_rule (first ticks still waiting out a debounce on a
+     * hot start) must not abort in the watchdog path. */
+    current_rule = NULL;
+    maybe_ping_watchdog();
+    CHECK(current_rule == NULL);
+
     close_sensor_fds(&sensor_set);
     rm_rf(fixture_root);
 

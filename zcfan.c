@@ -611,10 +611,42 @@ static enum set_fan_status set_fan_level(void) {
 }
 
 #define WATCHDOG_GRACE_PERIOD_SECS 2
+/* The EC can quietly drop manual fan control and resume its own automatic
+ * management (observed on a dual-fan model as one fan spinning while the
+ * other stays stopped at low temperatures). While zcfan holds a rule, the
+ * EC's automatic control must stay disengaged: detect a revert and
+ * re-assert the level. The status line reads "enabled" only while the EC's
+ * automatic control is running; a held manual level shows "disabled". */
+static void reassert_fan_control(void) {
+    FILE *f = fopen(FAN_CONTROL_FILE, "re");
+    char line[128];
+    char status[sizeof("disabled")];
+
+    if (!f)
+        return;
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (sscanf(line, "status: %8s", status) == 1 &&
+            strcmp(status, "enabled") == 0) {
+            printf("[FAN] EC reverted to automatic fan control, re-asserting "
+                   "%s\n",
+                   current_rule->name);
+            write_fan_level(current_rule->tpacpi_level);
+            break;
+        }
+    }
+    fclose(f);
+}
+
 static void maybe_ping_watchdog(void) {
     struct timespec now;
 
-    expect(current_rule);
+    /* On the first ticks no rule has been engaged yet: a hot start can sit
+     * above a threshold waiting out its debounce with current_rule still
+     * NULL. The watchdog was just armed at startup and there is no level to
+     * rewrite on resume detection yet, so there is nothing to do. */
+    if (!current_rule)
+        return;
+
     expect(clock_gettime(CLOCK_MONOTONIC_COARSE, &now) == 0);
 
     if (detect_suspend() == RESUME_DETECTED) {
@@ -628,6 +660,8 @@ static void maybe_ping_watchdog(void) {
         (watchdog_secs - WATCHDOG_GRACE_PERIOD_SECS)) {
         return;
     }
+
+    reassert_fan_control();
 
     // Transitioning from level 0 -> level 0 can cause a brief fan spinup on
     // some models, so don't reset the timer by write_fan_level().

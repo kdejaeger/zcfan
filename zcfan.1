@@ -118,6 +118,9 @@ watchdog_secs 10
 .EE
 .RE
 
+Along with each watchdog reset, zcfan verifies that the EC has not reverted
+to its own automatic fan control, and re-asserts the held level if it has.
+
 .SH DEPENDENCIES
 .B thinkpad-acpi
 must be loaded with
