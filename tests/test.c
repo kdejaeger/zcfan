@@ -234,9 +234,23 @@ int main(void) {
     write_file(path, "99000");
     CHECK(get_average_temp() == 68); /* die reading ignored */
 
-    /* Every hwmon0 reading invalid (0) leaves num_valid_temps == 0 while
-     * cores are still selected: the ACPI/EC sensor (60000) must be
-     * returned via the cpu_max path instead of erroring. */
+    /* Every excluded die label: they classify as ordinary sensors even on
+     * CPU temperature drivers, so no label variant can leak into control. */
+    make_temp("hwmon0", "temp5_input", "Tdie", 99000);
+    make_temp("hwmon0", "temp6_input", "Physical id 1", 99000);
+    make_temp("hwmon1", "temp3_input", "Tctl", 99000);
+    make_temp("hwmon1", "temp4_input", "Tccd", 99000);
+    refresh_sensors();
+    CHECK(sensor_for_path("hwmon0/temp5_input")->kind == SENSOR_OTHER);
+    CHECK(sensor_for_path("hwmon0/temp6_input")->kind == SENSOR_OTHER);
+    CHECK(sensor_for_path("hwmon1/temp3_input")->kind == SENSOR_OTHER);
+    CHECK(sensor_for_path("hwmon1/temp4_input")->kind == SENSOR_OTHER);
+    CHECK(get_average_temp() == 68); /* die spikes at 99C ignored */
+
+    /* With every averaged reading invalid (0) and die-labelled readings
+     * classified out, num_valid_temps == 0 while cores are still selected:
+     * the ACPI/EC sensor (60000) must be returned via the cpu_max path
+     * instead of erroring. */
     expect(snprintf(path, sizeof(path), "%s/hwmon0/temp1_input", fixture_root) >
            0);
     write_file(path, "0");
@@ -264,6 +278,15 @@ int main(void) {
     /* A NULL current_rule (first ticks still waiting out a debounce on a
      * hot start) must not abort in the watchdog path. */
     current_rule = NULL;
+    maybe_ping_watchdog();
+    CHECK(current_rule == NULL);
+
+    /* End to end for that hot-start sequence: an effective temperature in
+     * the maximum level's debounce window keeps current_rule NULL through
+     * set_fan_level() and the watchdog call that follows it in main(). */
+    write_file(path, "91000"); /* path: hwmon1/temp1_input */
+    CHECK(set_fan_level() == FAN_LEVEL_NOT_SET);
+    CHECK(current_rule == NULL);
     maybe_ping_watchdog();
     CHECK(current_rule == NULL);
 

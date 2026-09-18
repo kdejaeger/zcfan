@@ -8,7 +8,8 @@ zcfan - zero-configuration fan control daemon for ThinkPads
 is a minimal, zero-configuration fan control daemon for ThinkPads. It uses
 an arithmetic average of available temperature readings for fan control. When
 CPU-core readings can be identified, only those are averaged; otherwise CPU
-readings are preferred, with a fallback to all readable temperature inputs.
+readings are preferred, with a fallback to all readable temperature inputs
+(which can include die readings when no CPU sensor can be identified).
 The fan-control temperature is the maximum of the core average and the ACPI/EC
 sensor reading, the same reading the platform's critical-shutdown trip reacts
 to. Die/package readings are deliberately excluded: they spike hotter and
@@ -118,8 +119,9 @@ watchdog_secs 10
 .EE
 .RE
 
-Along with each watchdog reset, zcfan verifies that the EC has not reverted
-to its own automatic fan control, and re-asserts the held level if it has.
+At each periodic watchdog refresh, zcfan also verifies that the EC has not
+reverted to its own automatic fan control, and re-asserts the held level if
+it has.
 
 .SH DEPENDENCIES
 .B thinkpad-acpi

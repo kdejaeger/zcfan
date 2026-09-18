@@ -20,8 +20,9 @@ zcfan reads the temperature inputs exposed by the system's hwmon drivers and
 uses their arithmetic average for fan control. When identifiable CPU-core
 readings are available, only those readings are averaged. Otherwise, it uses
 CPU-labelled readings (or known CPU temperature drivers), and finally falls
-back to all readable temperature inputs. Unavailable and non-positive readings
-are ignored. The set of readable, non-ignored temperature inputs is re-checked
+back to all readable temperature inputs, which can include die readings when
+no CPU sensor can be identified. Unavailable and non-positive readings are
+ignored. The set of readable, non-ignored temperature inputs is re-checked
 roughly once per second, so hwmon drivers that register after zcfan has started
 (for example, coretemp being autoloaded by udev during boot) are picked up
 automatically. The fan-control temperature is the maximum of the core average

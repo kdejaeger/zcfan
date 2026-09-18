@@ -640,20 +640,21 @@ static void reassert_fan_control(void) {
 static void maybe_ping_watchdog(void) {
     struct timespec now;
 
-    /* On the first ticks no rule has been engaged yet: a hot start can sit
-     * above a threshold waiting out its debounce with current_rule still
-     * NULL. The watchdog was just armed at startup and there is no level to
-     * rewrite on resume detection yet, so there is nothing to do. */
-    if (!current_rule)
-        return;
-
     expect(clock_gettime(CLOCK_MONOTONIC_COARSE, &now) == 0);
 
+    /* On the first ticks no rule has been engaged yet: a hot start can sit
+     * above a threshold waiting out its debounce with current_rule still
+     * NULL. There is no level to rewrite on resume detection in that case;
+     * the next control tick engages one and writes it. The watchdog itself
+     * is still maintained (see below): nothing manual has been written, so
+     * the EC is in its automatic mode either way. */
     if (detect_suspend() == RESUME_DETECTED) {
         // On resume, some models need a manual fan write again, or they will
         // revert to "auto".
-        info("Clock jump detected, possible resume. Rewriting fan level\n");
-        write_fan_level(current_rule->tpacpi_level);
+        if (current_rule) {
+            info("Clock jump detected, possible resume. Rewriting fan level\n");
+            write_fan_level(current_rule->tpacpi_level);
+        }
     }
 
     if (now.tv_sec - last_watchdog_ping.tv_sec <
@@ -661,7 +662,10 @@ static void maybe_ping_watchdog(void) {
         return;
     }
 
-    reassert_fan_control();
+    /* With no rule engaged the EC is in its automatic mode (we have not
+     * written a level yet), so there is nothing to re-assert. */
+    if (current_rule)
+        reassert_fan_control();
 
     // Transitioning from level 0 -> level 0 can cause a brief fan spinup on
     // some models, so don't reset the timer by write_fan_level().
@@ -844,8 +848,11 @@ int main(int argc, char *argv[]) {
             pending_resume = 0;
             info("Fan control enabled for resume\n");
             fan_control_enabled = 1;
-            expect(current_rule);
-            write_fan_level(current_rule->tpacpi_level);
+            /* current_rule can still be NULL if we resumed during the
+             * startup debounce window; the next control tick engages a
+             * level and writes it. */
+            if (current_rule)
+                write_fan_level(current_rule->tpacpi_level);
             write_watchdog_timeout(watchdog_secs);
         }
     }
