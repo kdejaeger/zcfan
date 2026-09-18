@@ -24,7 +24,10 @@ back to all readable temperature inputs. Unavailable and non-positive readings
 are ignored. The set of readable, non-ignored temperature inputs is re-checked
 roughly once per second, so hwmon drivers that register after zcfan has started
 (for example, coretemp being autoloaded by udev during boot) are picked up
-automatically. It has the following default fan states:
+automatically. The fan-control temperature is the maximum of the core average
+and the hottest CPU-level reading (typically the ACPI/EC sensor, which the
+firmware's critical shutdown trip reacts to). zcfan has the following default
+fan states:
 
 | Config name     | thinkpad_acpi fan level           | Default trip temperature (C) | Default debounce (s) |
 |-----------------|-----------------------------------|------------------------------|----------------------|
@@ -58,6 +61,9 @@ parameters. A value of `0` or `1` engages the level immediately. For example:
     max_debounce_secs 1
     med_debounce_secs 3
     low_debounce_secs 5
+
+The debounce is bypassed at 95C and above: the maximum fan level is engaged
+immediately, to stay clear of the firmware's critical shutdown temperature.
 
 ### Ignoring sensors
 

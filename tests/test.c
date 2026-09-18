@@ -216,6 +216,43 @@ int main(void) {
     CHECK(sensor_set.num_sensor_fds == 7);
     CHECK(get_average_temp() == 68);
 
+    /* The effective temperature is the maximum of the core average and the
+     * hottest CPU-level (package/EC) reading: that reading leads the core
+     * average and is what the firmware's critical trip reacts to. */
+    expect(snprintf(path, sizeof(path), "%s/hwmon1/temp1_input", fixture_root) >
+           0);
+    write_file(path, "95000");
+    CHECK(get_average_temp() == 95); /* hottest CPU-level reading wins */
+    write_file(path, "60000");
+    CHECK(get_average_temp() == 68); /* 68C average beats 60C CPU-level */
+
+    /* Every hwmon0 reading invalid (0) leaves num_valid_temps == 0 while
+     * cores are still selected: the hottest CPU-level sensor (60000) must
+     * be returned via the cpu_max path instead of erroring. */
+    expect(snprintf(path, sizeof(path), "%s/hwmon0/temp1_input", fixture_root) >
+           0);
+    write_file(path, "0");
+    expect(snprintf(path, sizeof(path), "%s/hwmon0/temp2_input", fixture_root) >
+           0);
+    write_file(path, "0");
+    expect(snprintf(path, sizeof(path), "%s/hwmon0/temp3_input", fixture_root) >
+           0);
+    write_file(path, "0");
+    expect(snprintf(path, sizeof(path), "%s/hwmon0/temp4_input", fixture_root) >
+           0);
+    write_file(path, "0");
+    CHECK(get_average_temp() == 60); /* hwmon1's CPU sensor survives */
+
+    /* The 95C panic path engages maximum immediately, bypassing debounce:
+     * from FAN_OFF with no debounce ticks accrued, the level still moves.
+     * (The fan write itself fails without thinkpad_acpi; ignored.) */
+    expect(snprintf(path, sizeof(path), "%s/hwmon1/temp1_input", fixture_root) >
+           0);
+    write_file(path, "95000");
+    current_rule = rules + FAN_OFF;
+    CHECK(set_fan_level() == FAN_LEVEL_SET);
+    CHECK(current_rule == rules + FAN_MAX);
+
     close_sensor_fds(&sensor_set);
     rm_rf(fixture_root);
 

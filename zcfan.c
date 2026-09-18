@@ -444,6 +444,7 @@ static int read_temp_fd(int fd) {
 static int get_average_temp(void) {
     int64_t temp_sum = 0;
     size_t num_valid_temps = 0;
+    int cpu_max = TEMP_INVALID;
     enum SensorKind selected_kind = SENSOR_OTHER;
     if (sensor_set.num_cpu_core_sensors > 0)
         selected_kind = SENSOR_CPU_CORE;
@@ -451,24 +452,34 @@ static int get_average_temp(void) {
         selected_kind = SENSOR_CPU;
 
     for (size_t i = 0; i < sensor_set.num_sensor_fds; i++) {
-        if (selected_kind != SENSOR_OTHER &&
-            sensor_set.sensors[i].kind != selected_kind)
-            continue;
         int temp = read_temp_fd(sensor_set.sensors[i].fd);
         if (temp == TEMP_INVALID || temp <= 0)
+            continue;
+        /* Track the hottest CPU-level (package/EC) reading, e.g. the ACPI
+         * sensor that feeds the firmware's critical shutdown trip. */
+        if (sensor_set.sensors[i].kind == SENSOR_CPU && temp > cpu_max)
+            cpu_max = temp;
+        if (selected_kind != SENSOR_OTHER &&
+            sensor_set.sensors[i].kind != selected_kind)
             continue;
         temp_sum += temp;
         num_valid_temps++;
     }
 
-    if (num_valid_temps == 0) {
+    if (num_valid_temps == 0 && cpu_max == TEMP_INVALID) {
         err("Couldn't find any valid temperature\n");
         exit_if_first_tick();
         return TEMP_INVALID;
     }
 
-    int average_temp = (int)(temp_sum / (int64_t)num_valid_temps);
-    return MILLIC_TO_C(average_temp);
+    /* Fan-control temperature: the maximum of the core average and the
+     * hottest CPU-level sensor reading. */
+    int average_temp = TEMP_INVALID;
+    if (num_valid_temps > 0)
+        average_temp = MILLIC_TO_C((int)(temp_sum / (int64_t)num_valid_temps));
+    if (cpu_max != TEMP_INVALID)
+        cpu_max = MILLIC_TO_C(cpu_max);
+    return cpu_max > average_temp ? cpu_max : average_temp;
 }
 
 #define write_fan_level(level) write_fan("level", level)
@@ -523,6 +534,21 @@ static enum set_fan_status set_fan_level(void) {
     if (average_temp == TEMP_INVALID) {
         write_fan_level("full-speed");
         return FAN_LEVEL_INVALID;
+    }
+
+    /* Panic: at 95C we are only a few degrees below the firmware's critical
+     * trip point (typically 98C-105C on ThinkPads, fed by the ACPI/EC
+     * sensor), so engage maximum immediately rather than waiting out the
+     * debounce. */
+    if (average_temp >= 95 && current_rule != rules + FAN_MAX) {
+        const struct Rule *rule = rules + FAN_MAX;
+        current_rule = rule;
+        tick_penalty = tick_hysteresis;
+        printf("[FAN] Temperature now %dC, at or above panic threshold 95C, "
+               "fan set to %s\n",
+               average_temp, rule->name);
+        write_fan_level(rule->tpacpi_level);
+        return FAN_LEVEL_SET;
     }
 
     for (size_t i = 0; i < FAN_INVALID; i++) {

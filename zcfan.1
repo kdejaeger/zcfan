@@ -9,9 +9,10 @@ is a minimal, zero-configuration fan control daemon for ThinkPads. It uses
 an arithmetic average of available temperature readings for fan control. When
 CPU-core readings can be identified, only those are averaged; otherwise CPU
 readings are preferred, with a fallback to all readable temperature inputs.
-Unavailable and non-positive readings are ignored. The set of readable,
-non-ignored temperature inputs is re-checked roughly once per second, so hwmon
-drivers that register after
+The fan-control temperature is the maximum of the core average and the hottest
+CPU-level (ACPI/EC or package) reading. Unavailable and non-positive readings are
+ignored. The set of readable, non-ignored temperature inputs is re-checked
+roughly once per second, so hwmon drivers that register after
 .B zcfan
 has started (for example, coretemp being autoloaded by udev during boot) are
 picked up automatically.
@@ -98,6 +99,9 @@ remain above that level's trip point for a number of consecutive seconds set by
 .I max_debounce_secs
 (defaults 60, 30, and 10). This prevents brief temperature spikes from needlessly
 spinning the fans up. A value of 0 or 1 engages the level immediately.
+
+The debounce is bypassed at 95C and above: the maximum fan level is engaged
+immediately, to stay clear of the firmware's critical shutdown temperature.
 
 .SS WATCHDOG
 
