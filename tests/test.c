@@ -70,12 +70,39 @@ static void make_temp(const char *hwmon, const char *temp, const char *label,
     }
 }
 
-static const struct Sensor *sensor_for_path(const char *path) {
+static struct Sensor *sensor_for_path(const char *path) {
     for (size_t i = 0; i < sensor_set.num_sensor_fds; i++) {
         if (strcmp(sensor_set.sensors[i].path, path) == 0)
             return &sensor_set.sensors[i];
     }
     return NULL;
+}
+
+/* Convenience accessor for the control temperature from get_fan_temps(). */
+static int control_temp(void) { return get_fan_temps().control_temp; }
+
+/* Redirect stdout to a fixture file so [FAN] log lines can be asserted on.
+ * Capture windows must contain no CHECK calls: CHECK reports failures via
+ * stdout. Callers restore the returned stream before asserting. */
+static FILE *capture_fan_log(const char *path) {
+    fflush(stdout);
+    FILE *saved_stdout = stdout;
+    stdout = fopen(path, "w");
+    expect(stdout != NULL);
+    return saved_stdout;
+}
+
+static void read_fan_log(const char *path, FILE *saved_stdout, char *line,
+                         size_t size) {
+    fflush(stdout);
+    expect(fclose(stdout) == 0);
+    stdout = saved_stdout;
+    FILE *log = fopen(path, "re");
+    expect(log != NULL);
+    expect(fgets(line, (int)size, log) != NULL);
+    char extra[4];
+    expect(fgets(extra, (int)sizeof(extra), log) == NULL); /* one line only */
+    expect(fclose(log) == 0);
 }
 
 static void rm_rf(const char *path) {
@@ -117,19 +144,19 @@ int main(void) {
     /* Initial scan: classification and averaging. */
     CHECK(populate_sensor_fds(&sensor_set));
     CHECK(sensor_set.num_sensor_fds == 7);
-    CHECK(sensor_set.num_cpu_core_sensors == 3);
-    CHECK(sensor_set.num_cpu_temp_sensors == 4);
+    CHECK(sensor_set.num_core_sensors == 3);
+    CHECK(sensor_set.num_control_sensors == 4);
     CHECK(sensor_set.num_ignored_sensors == 0);
     CHECK(sensor_for_path("hwmon0/temp2_input")->kind == SENSOR_CPU_CORE);
-    CHECK(sensor_for_path("hwmon0/temp1_input")->kind ==
-          SENSOR_OTHER); /* die/package reading: excluded from control */
+    /* Die/package reading: excluded from control. */
+    CHECK(sensor_for_path("hwmon0/temp1_input")->kind == SENSOR_OTHER);
     CHECK(sensor_for_path("hwmon1/temp1_input")->kind == SENSOR_CPU);
     CHECK(sensor_for_path("hwmon2/temp1_input")->kind == SENSOR_OTHER);
     for (size_t i = 1; i < sensor_set.num_sensor_fds; i++) {
         CHECK(strcmp(sensor_set.sensors[i - 1].path,
                      sensor_set.sensors[i].path) < 0);
     }
-    CHECK(get_average_temp() == 52); /* mean of the three cores */
+    CHECK(control_temp() == 52); /* mean of the three cores */
 
     /* Unchanged refresh: silent, and the active fds are kept. */
     int fd_before = sensor_for_path("hwmon0/temp2_input")->fd;
@@ -142,8 +169,8 @@ int main(void) {
     make_temp("hwmon3", "temp1_input", "Core 9", 60000);
     refresh_sensors();
     CHECK(sensor_set.num_sensor_fds == 8);
-    CHECK(sensor_set.num_cpu_core_sensors == 4);
-    CHECK(get_average_temp() == 54);
+    CHECK(sensor_set.num_core_sensors == 4);
+    CHECK(control_temp() == 54);
     CHECK(sensor_for_path("hwmon3/temp1_input")->kind == SENSOR_CPU_CORE);
 
     /* Removal is picked up again. */
@@ -160,8 +187,8 @@ int main(void) {
     expect(rmdir(path) == 0);
     refresh_sensors();
     CHECK(sensor_set.num_sensor_fds == 7);
-    CHECK(sensor_set.num_cpu_core_sensors == 3);
-    CHECK(get_average_temp() == 52);
+    CHECK(sensor_set.num_core_sensors == 3);
+    CHECK(control_temp() == 52);
 
     /* Driver reload into the same hwmonN: identical path and kind, but a new
      * inode. A stale fd would keep reading the pre-replacement content. */
@@ -175,9 +202,9 @@ int main(void) {
     expect(rename(tmp_path, path) == 0);
     refresh_sensors();
     CHECK(sensor_set.num_sensor_fds == 7);
-    CHECK(sensor_set.num_cpu_core_sensors == 3);
+    CHECK(sensor_set.num_core_sensors == 3);
     CHECK(sensor_for_path("hwmon0/temp2_input")->ino != ino_before);
-    CHECK(get_average_temp() == 68); /* 99000 replaces 50000 in the mean */
+    CHECK(control_temp() == 68); /* 99000 replaces 50000 in the mean */
 
     /* An unreadable input makes the scan incomplete: the partial snapshot
      * must be discarded and the active set retained. */
@@ -186,11 +213,11 @@ int main(void) {
     expect(symlink("/nonexistent-target", path) == 0);
     refresh_sensors();
     CHECK(sensor_set.num_sensor_fds == 7);
-    CHECK(get_average_temp() == 68);
+    CHECK(control_temp() == 68);
     expect(unlink(path) == 0);
     refresh_sensors();
     CHECK(sensor_set.num_sensor_fds == 7);
-    CHECK(get_average_temp() == 68);
+    CHECK(control_temp() == 68);
 
     /* A hwmon device that vanishes mid-scan (here: dangling symlink): its
      * directory open fails, the scan is incomplete, and the active set must
@@ -199,23 +226,23 @@ int main(void) {
     expect(symlink("/nonexistent-target", path) == 0);
     refresh_sensors();
     CHECK(sensor_set.num_sensor_fds == 7);
-    CHECK(get_average_temp() == 68);
+    CHECK(control_temp() == 68);
     expect(unlink(path) == 0);
     refresh_sensors();
     CHECK(sensor_set.num_sensor_fds == 7);
-    CHECK(get_average_temp() == 68);
+    CHECK(control_temp() == 68);
 
     /* A failing hwmon root must not crash the daemon (this exits on the
      * first tick; first_tick is cleared here to model steady state). */
-    first_tick = 0;
+    first_tick = false;
     hwmon_root = "/nonexistent-zcfan-test";
     refresh_sensors();
     CHECK(sensor_set.num_sensor_fds == 7);
-    CHECK(get_average_temp() == 68);
+    CHECK(control_temp() == 68);
     hwmon_root = fixture_root;
     refresh_sensors();
     CHECK(sensor_set.num_sensor_fds == 7);
-    CHECK(get_average_temp() == 68);
+    CHECK(control_temp() == 68);
 
     /* The effective temperature is the maximum of the core average and the
      * ACPI/EC sensor reading: that sensor is what the firmware's critical
@@ -223,16 +250,16 @@ int main(void) {
     expect(snprintf(path, sizeof(path), "%s/hwmon1/temp1_input", fixture_root) >
            0);
     write_file(path, "95000");
-    CHECK(get_average_temp() == 95); /* ACPI/EC sensor wins over the average */
+    CHECK(control_temp() == 95); /* ACPI/EC sensor wins over the average */
     write_file(path, "60000");
-    CHECK(get_average_temp() == 68); /* 68C average beats 60C ACPI/EC */
+    CHECK(control_temp() == 68); /* 68C average beats 60C ACPI/EC */
 
     /* A die/package spike must not move the control temperature: hwmon0's
      * "Package id 0" is deliberately excluded from fan control. */
     expect(snprintf(path, sizeof(path), "%s/hwmon0/temp1_input", fixture_root) >
            0);
     write_file(path, "99000");
-    CHECK(get_average_temp() == 68); /* die reading ignored */
+    CHECK(control_temp() == 68); /* die reading ignored */
 
     /* Every excluded die label: they classify as ordinary sensors even on
      * CPU temperature drivers, so no label variant can leak into control. */
@@ -245,7 +272,7 @@ int main(void) {
     CHECK(sensor_for_path("hwmon0/temp6_input")->kind == SENSOR_OTHER);
     CHECK(sensor_for_path("hwmon1/temp3_input")->kind == SENSOR_OTHER);
     CHECK(sensor_for_path("hwmon1/temp4_input")->kind == SENSOR_OTHER);
-    CHECK(get_average_temp() == 68); /* die spikes at 99C ignored */
+    CHECK(control_temp() == 68); /* die spikes at 99C ignored */
 
     /* With every averaged reading invalid (0) and die-labelled readings
      * classified out, num_valid_temps == 0 while cores are still selected:
@@ -263,7 +290,7 @@ int main(void) {
     expect(snprintf(path, sizeof(path), "%s/hwmon0/temp4_input", fixture_root) >
            0);
     write_file(path, "0");
-    CHECK(get_average_temp() == 60); /* hwmon1's ACPI/EC sensor survives */
+    CHECK(control_temp() == 60); /* hwmon1's ACPI/EC sensor survives */
 
     /* The 95C panic path engages maximum immediately, bypassing debounce:
      * from FAN_OFF with no debounce ticks accrued, the level still moves.
@@ -289,6 +316,285 @@ int main(void) {
     CHECK(current_rule == NULL);
     maybe_ping_watchdog();
     CHECK(current_rule == NULL);
+
+    /* Reductions follow the core average alone. Engage maximum via the
+     * ACPI/EC sensor, then hold the EC reading at 75C (above the low
+     * threshold) while the cores cool: the fan must still step down and
+     * off. Per-call assertions guard the whole trajectory, so a masked
+     * intermediate transition cannot pass. */
+    make_temp("hwmon1", "temp1_input", NULL, 95000);
+    CHECK(set_fan_level() == FAN_LEVEL_SET);
+    CHECK(current_rule == rules + FAN_MAX);
+
+    make_temp("hwmon1", "temp1_input", NULL, 75000);
+    make_temp("hwmon0", "temp2_input", NULL, 55000);
+    make_temp("hwmon0", "temp3_input", NULL, 57000);
+    make_temp("hwmon0", "temp4_input", NULL, 59000);
+    const struct Rule *reduction_path[] = {rules + FAN_MAX, rules + FAN_MAX,
+                                           rules + FAN_LOW, rules + FAN_LOW,
+                                           rules + FAN_LOW};
+    for (int i = 0; i < 5; i++) {
+        const struct Rule *before = current_rule;
+        enum set_fan_status st = set_fan_level();
+        CHECK(current_rule == reduction_path[i]);
+        /* SET exactly when the level changed. */
+        CHECK(st ==
+              (current_rule != before ? FAN_LEVEL_SET : FAN_LEVEL_NOT_SET));
+    }
+
+    make_temp("hwmon0", "temp2_input", NULL, 45000);
+    make_temp("hwmon0", "temp3_input", NULL, 47000);
+    make_temp("hwmon0", "temp4_input", NULL, 49000);
+    const struct Rule *off_path[] = {rules + FAN_OFF, rules + FAN_OFF,
+                                     rules + FAN_OFF, rules + FAN_OFF,
+                                     rules + FAN_OFF};
+    for (int i = 0; i < 5; i++) {
+        const struct Rule *before = current_rule;
+        enum set_fan_status st = set_fan_level();
+        CHECK(current_rule == off_path[i]);
+        /* SET exactly when the level changed. */
+        CHECK(st ==
+              (current_rule != before ? FAN_LEVEL_SET : FAN_LEVEL_NOT_SET));
+    }
+
+    /* In the panic band maximum must be held outright, even at the band's
+     * exact lower edge (95C), although the cores are cool. */
+    make_temp("hwmon1", "temp1_input", NULL, 95000);
+    CHECK(set_fan_level() == FAN_LEVEL_SET);
+    CHECK(current_rule == rules + FAN_MAX);
+    for (int i = 0; i < 5; i++) {
+        const struct Rule *before = current_rule;
+        enum set_fan_status st = set_fan_level();
+        CHECK(current_rule == rules + FAN_MAX);
+        /* SET exactly when the level changed. */
+        CHECK(st ==
+              (current_rule != before ? FAN_LEVEL_SET : FAN_LEVEL_NOT_SET));
+    }
+
+    /* Leaving the panic band resumes core-average reductions: a 75C control
+     * temperature with a 47C core average steps straight from maximum to
+     * off. */
+    make_temp("hwmon1", "temp1_input", NULL, 75000);
+    CHECK(set_fan_level() == FAN_LEVEL_SET);
+    CHECK(current_rule == rules + FAN_OFF);
+
+    /* With the core average unreadable the ACPI/EC reading drives both
+     * directions: 95C panics to maximum and a falling EC reading reduces
+     * again. */
+    make_temp("hwmon0", "temp2_input", NULL, 0);
+    make_temp("hwmon0", "temp3_input", NULL, 0);
+    make_temp("hwmon0", "temp4_input", NULL, 0);
+    make_temp("hwmon1", "temp1_input", NULL, 95000);
+    CHECK(set_fan_level() == FAN_LEVEL_SET);
+    CHECK(current_rule == rules + FAN_MAX);
+    make_temp("hwmon1", "temp1_input", NULL, 65000);
+    const struct Rule *ec_path[] = {rules + FAN_MAX, rules + FAN_MAX,
+                                    rules + FAN_MED, rules + FAN_MED,
+                                    rules + FAN_MED};
+    for (int i = 0; i < 5; i++) {
+        const struct Rule *before = current_rule;
+        enum set_fan_status st = set_fan_level();
+        CHECK(current_rule == ec_path[i]);
+        /* SET exactly when the level changed. */
+        CHECK(st ==
+              (current_rule != before ? FAN_LEVEL_SET : FAN_LEVEL_NOT_SET));
+    }
+    make_temp("hwmon1", "temp1_input", NULL, 45000);
+    CHECK(set_fan_level() == FAN_LEVEL_SET);
+    CHECK(current_rule == rules + FAN_OFF);
+
+    /* A pending raise must not block a reduction: with the fan at low, a
+     * 47C core average forces off even while a medium raise (EC 85C) is
+     * still waiting out its debounce. */
+    memset(level_ticks, 0, sizeof(level_ticks));
+    make_temp("hwmon0", "temp2_input", NULL, 45000);
+    make_temp("hwmon0", "temp3_input", NULL, 47000);
+    make_temp("hwmon0", "temp4_input", NULL, 49000);
+    make_temp("hwmon1", "temp1_input", NULL, 85000);
+    current_rule = rules + FAN_LOW;
+    const struct Rule *bypass_path[] = {rules + FAN_LOW, rules + FAN_LOW,
+                                        rules + FAN_OFF, rules + FAN_OFF,
+                                        rules + FAN_OFF};
+    for (int i = 0; i < 5; i++) {
+        const struct Rule *before = current_rule;
+        enum set_fan_status st = set_fan_level();
+        CHECK(current_rule == bypass_path[i]);
+        /* SET exactly when the level changed. */
+        CHECK(st ==
+              (current_rule != before ? FAN_LEVEL_SET : FAN_LEVEL_NOT_SET));
+    }
+
+    /* The bypass applies to every pending upward candidate: with the fan
+     * at medium, a 55C core average reduces to low even though a maximum
+     * raise (EC 94C) is still waiting out its debounce. */
+    memset(level_ticks, 0, sizeof(level_ticks));
+    make_temp("hwmon0", "temp2_input", NULL, 45000);
+    make_temp("hwmon0", "temp3_input", NULL, 55000);
+    make_temp("hwmon0", "temp4_input", NULL, 65000);
+    make_temp("hwmon1", "temp1_input", NULL, 94000);
+    current_rule = rules + FAN_MED;
+    CHECK(set_fan_level() == FAN_LEVEL_SET); /* reduces despite pending max */
+    CHECK(current_rule == rules + FAN_LOW);
+    for (int i = 0; i < 4; i++) {
+        CHECK(set_fan_level() == FAN_LEVEL_NOT_SET); /* low holds */
+        CHECK(current_rule == rules + FAN_LOW);
+    }
+
+    /* Control-driven first engagement: from a clean state a 75C control
+     * temperature (cool cores, EC 75C) engages low after its full 60-tick
+     * debounce. */
+    memset(level_ticks, 0, sizeof(level_ticks));
+    current_rule = NULL;
+    make_temp("hwmon0", "temp2_input", NULL, 45000);
+    make_temp("hwmon0", "temp3_input", NULL, 47000);
+    make_temp("hwmon0", "temp4_input", NULL, 49000);
+    make_temp("hwmon1", "temp1_input", NULL, 75000);
+    for (int i = 0; i < 59; i++) {
+        CHECK(set_fan_level() == FAN_LEVEL_NOT_SET);
+        CHECK(current_rule == NULL);
+    }
+    CHECK(set_fan_level() == FAN_LEVEL_SET);
+    CHECK(current_rule == rules + FAN_LOW);
+
+    /* Unit: transition labels follow the deciding input. */
+    CHECK(strcmp(fan_source(true, true), "Temperature") == 0);
+    CHECK(strcmp(fan_source(false, true), "Core average") == 0);
+    CHECK(strcmp(fan_source(false, false), "Temperature") == 0);
+
+    /* Stale up-debounce credit must not re-engage a departed level: while
+     * the EC reading holds at 85C, medium's counter is already full when
+     * medium is left, so the reduction must clear it and medium may only
+     * re-engage on the 30th fresh tick. */
+    memset(level_ticks, 0, sizeof(level_ticks));
+    current_rule = NULL;
+    make_temp("hwmon1", "temp1_input", NULL, 85000);
+    make_temp("hwmon0", "temp2_input", NULL, 52000);
+    make_temp("hwmon0", "temp3_input", NULL, 55000);
+    make_temp("hwmon0", "temp4_input", NULL, 58000);
+    for (int i = 0; i < 29; i++) {
+        CHECK(set_fan_level() == FAN_LEVEL_NOT_SET);
+        CHECK(current_rule == NULL);
+    }
+    CHECK(set_fan_level() == FAN_LEVEL_SET);
+    CHECK(current_rule == rules + FAN_MED);
+    const struct Rule *stale_path[] = {
+        rules + FAN_MED, rules + FAN_MED, rules + FAN_LOW, rules + FAN_LOW,
+        rules + FAN_LOW, rules + FAN_LOW, rules + FAN_LOW, rules + FAN_LOW,
+        rules + FAN_LOW, rules + FAN_LOW, rules + FAN_LOW, rules + FAN_LOW,
+        rules + FAN_LOW, rules + FAN_LOW, rules + FAN_LOW, rules + FAN_LOW,
+        rules + FAN_LOW, rules + FAN_LOW, rules + FAN_LOW, rules + FAN_LOW,
+        rules + FAN_LOW, rules + FAN_LOW, rules + FAN_LOW, rules + FAN_LOW,
+        rules + FAN_LOW, rules + FAN_LOW, rules + FAN_LOW, rules + FAN_LOW,
+        rules + FAN_LOW, rules + FAN_LOW, rules + FAN_LOW, rules + FAN_LOW,
+        rules + FAN_MED};
+    for (int i = 0; i < 33; i++) {
+        const struct Rule *before = current_rule;
+        enum set_fan_status st = set_fan_level();
+        CHECK(current_rule == stale_path[i]);
+        /* SET exactly when the level changed. */
+        CHECK(st ==
+              (current_rule != before ? FAN_LEVEL_SET : FAN_LEVEL_NOT_SET));
+    }
+
+    /* Integration: the labels must reach the real transition log. The
+     * capture windows contain no CHECKs; each window's third call reduces
+     * (the first two drain the freshly-engaged hold and print nothing). */
+    char log_path[640];
+    expect(snprintf(log_path, sizeof(log_path), "%s/fan-log", fixture_root) >
+           0);
+
+    /* Core-driven reduction: medium to low on a 55C core average while the
+     * EC reading holds at 85C. The first two calls drain the freshly
+     * engaged hold; only the third reduces and emits the log line. */
+    FILE *saved_stdout = capture_fan_log(log_path);
+    enum set_fan_status first = set_fan_level();
+    enum set_fan_status second = set_fan_level();
+    enum set_fan_status third = set_fan_level();
+    char log_line[256];
+    read_fan_log(log_path, saved_stdout, log_line, sizeof(log_line));
+    CHECK(first == FAN_LEVEL_NOT_SET);
+    CHECK(second == FAN_LEVEL_NOT_SET);
+    CHECK(third == FAN_LEVEL_SET); /* the transition emits the line */
+    CHECK(strstr(log_line, "Core average now 55C, fan set to low") != NULL);
+
+    /* Control-driven (unreadable core average): low to off on a 45C ACPI/EC
+     * reading. */
+    make_temp("hwmon0", "temp2_input", NULL, 0);
+    make_temp("hwmon0", "temp3_input", NULL, 0);
+    make_temp("hwmon0", "temp4_input", NULL, 0);
+    make_temp("hwmon1", "temp1_input", NULL, 45000);
+    saved_stdout = capture_fan_log(log_path);
+    first = set_fan_level();
+    second = set_fan_level();
+    third = set_fan_level();
+    read_fan_log(log_path, saved_stdout, log_line, sizeof(log_line));
+    CHECK(first == FAN_LEVEL_NOT_SET);
+    CHECK(second == FAN_LEVEL_NOT_SET);
+    CHECK(third == FAN_LEVEL_SET); /* the transition emits the line */
+    CHECK(strstr(log_line, "Temperature now 45C, fan set to off") != NULL);
+
+    /* No-core configuration, simulated by demoting the core readings to
+     * OTHER and promoting the nvme reading to EC-kind: with no genuine core
+     * average, reductions must follow the control temperature rather than
+     * the mean of the EC-kind readings (68C, below their 95C maximum). */
+    enum SensorKind core_kind = SENSOR_CPU_CORE;
+    sensor_for_path("hwmon0/temp2_input")->kind = SENSOR_OTHER;
+    sensor_for_path("hwmon0/temp3_input")->kind = SENSOR_OTHER;
+    sensor_for_path("hwmon0/temp4_input")->kind = SENSOR_OTHER;
+    sensor_for_path("hwmon2/temp1_input")->kind = SENSOR_CPU;
+    size_t saved_core_count = sensor_set.num_core_sensors;
+    size_t saved_control_count = sensor_set.num_control_sensors;
+    sensor_set.num_core_sensors = 0;
+    sensor_set.num_control_sensors = 2;
+    make_temp("hwmon1", "temp1_input", NULL, 95000);
+    struct FanTemps temps = get_fan_temps();
+    CHECK(temps.average_is_core == false);
+    CHECK(temps.average_temp == 95); /* folded up, not the 68C EC-kind mean */
+    CHECK(temps.control_temp == 95);
+    CHECK(set_fan_level() == FAN_LEVEL_SET); /* panic engages maximum */
+    CHECK(current_rule == rules + FAN_MAX);
+    make_temp("hwmon1", "temp1_input", NULL, 85000);
+    for (int i = 0; i < 5; i++) {
+        set_fan_level();
+        CHECK(current_rule == rules + FAN_MAX); /* reduction follows control */
+    }
+    sensor_for_path("hwmon0/temp2_input")->kind = core_kind;
+    sensor_for_path("hwmon0/temp3_input")->kind = core_kind;
+    sensor_for_path("hwmon0/temp4_input")->kind = core_kind;
+    sensor_for_path("hwmon2/temp1_input")->kind = SENSOR_OTHER;
+    sensor_set.num_core_sensors = saved_core_count;
+    sensor_set.num_control_sensors = saved_control_count;
+
+    /* A custom threshold can sit above the panic band: maximum must be
+     * held outright while the reading persists, independent of discounted
+     * thresholds. */
+    char config_file[640];
+    expect(snprintf(config_file, sizeof(config_file), "%s/zcfan.conf",
+                    fixture_root) > 0);
+    write_file(config_file, "max_temp 115\n");
+    config_path = config_file;
+    get_config();
+    CHECK(rules[FAN_MAX].threshold == 115);
+    current_rule = rules + FAN_OFF;
+    memset(level_ticks, 0, sizeof(level_ticks));
+    /* The configured threshold must govern engagement: 94C stays below a
+     * 115C maximum for the whole debounce window (with the default 90C it
+     * would engage on the tenth tick). */
+    make_temp("hwmon1", "temp1_input", NULL, 94000);
+    for (int i = 0; i < 10; i++) {
+        CHECK(set_fan_level() == FAN_LEVEL_NOT_SET);
+        CHECK(current_rule == rules + FAN_OFF);
+    }
+    /* the band engages and holds independently of the threshold */
+    make_temp("hwmon1", "temp1_input", NULL, 95000);
+    CHECK(set_fan_level() == FAN_LEVEL_SET); /* panic engages maximum */
+    CHECK(current_rule == rules + FAN_MAX);
+    for (int i = 0; i < 5; i++) {
+        CHECK(set_fan_level() == FAN_LEVEL_NOT_SET); /* held at the edge */
+        CHECK(current_rule == rules + FAN_MAX);
+    }
+    rules[FAN_MAX].threshold = 90;
+    config_path = CONFIG_PATH;
 
     close_sensor_fds(&sensor_set);
     rm_rf(fixture_root);

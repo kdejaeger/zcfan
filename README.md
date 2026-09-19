@@ -28,8 +28,12 @@ roughly once per second, so hwmon drivers that register after zcfan has started
 automatically. The fan-control temperature is the maximum of the core average
 and the ACPI/EC sensor reading (the same reading the firmware's critical
 shutdown trip reacts to). Die/package sensor readings are deliberately
-excluded: they spike hotter and faster than the trip sensor. zcfan has the
-following default fan states:
+excluded: they spike hotter and faster than the trip sensor. The ACPI/EC
+reading normally only raises the fan (engagement and the 95C panic, which
+also holds maximum): level reductions follow the core average, except when
+no genuine core average exists (then the fan-control temperature decides)
+and in the 95C panic band (then no reduction is considered at all: maximum
+is held outright). zcfan has the following default fan states:
 
 | Config name     | thinkpad_acpi fan level           | Default trip temperature (C) | Default debounce (s) |
 |-----------------|-----------------------------------|------------------------------|----------------------|
@@ -37,11 +41,15 @@ following default fan states:
 | med_temp        | 4                                 | 80                           | 30                   |
 | low_temp        | 1                                 | 70                           | 60                   |
 
-If no trip temperature is reached, the fan will be turned off.
+If no trip temperature is reached (and the reading is below the 95C panic
+band), the fan will be turned off.
 
-The fan will also only be reduced once the average temperature is now at least
-20C below the trip temperature for the current fan state. This can be tuned with
-the config parameter `temp_hysteresis`.
+The fan will also only be reduced once the core average is at least 20C below
+the trip temperature for the current fan state. In the 95C panic band no
+reduction is considered at all (maximum is held outright), and when no
+genuine core average is available the fan-control temperature decides
+instead (see above). This can be tuned with the config parameter
+`temp_hysteresis`.
 
 To override these defaults, you can place a file at `/etc/zcfan.conf` with
 updated trip temperatures in degrees celsius and/or fan levels. As an example:
@@ -55,7 +63,7 @@ updated trip temperatures in degrees celsius and/or fan levels. As an example:
     med_level 4
     low_level 1
 
-The number of consecutive seconds the average temperature must stay above a
+The number of consecutive seconds the fan-control temperature must stay above a
 level's trip temperature before that level is engaged can be set per level with
 the `max_debounce_secs`, `med_debounce_secs`, and `low_debounce_secs` config
 parameters. A value of `0` or `1` engages the level immediately. For example:
@@ -65,7 +73,8 @@ parameters. A value of `0` or `1` engages the level immediately. For example:
     low_debounce_secs 5
 
 The debounce is bypassed at 95C and above: the maximum fan level is engaged
-immediately, to stay clear of the firmware's critical shutdown temperature.
+immediately and held while the temperature stays there, to stay clear of the
+firmware's critical shutdown temperature.
 
 ### Ignoring sensors
 
@@ -90,16 +99,19 @@ file:
 
 We will only reduce the fan level again once:
 
-1. The average temperature is now at least `temp_hysteresis` Celsius (default
-   20C) below the trip point, and
+1. The core average is at least `temp_hysteresis` Celsius (default 20C)
+   below the trip point -- except in the 95C panic band and when the core
+   average is unreadable, where the fan-control temperature decides (see
+   above), and
 2. At least 3 seconds have elapsed since the initial trip.
 
 This avoids unnecessary fluctuations in fan speed.
 
 ### Debounce
 
-Conversely, before we engage a *higher* fan level, the average temperature must
-remain above that level's trip point for a number of consecutive seconds set by
+Conversely, before we engage a *higher* fan level, the fan-control temperature
+must remain above that level's trip point for a number of consecutive seconds
+set by
 `low_debounce_secs`, `med_debounce_secs`, and `max_debounce_secs` (defaults 60,
 30, and 10). This prevents brief temperature spikes from needlessly spinning the
 fans up. A value of `0` or `1` engages the level immediately.

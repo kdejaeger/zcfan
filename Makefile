@@ -58,7 +58,7 @@ install: all
 	$(INSTALL) -Dp -m 644 zcfan.1 $(DESTDIR)$(mandir)/man1/zcfan.1
 
 lint:
-	clang-format -style=file --dry-run --Werror zcfan.c
+	clang-format -style=file --dry-run --Werror zcfan.c tests/test.c
 
 check: tests/test-runner
 	./tests/test-runner

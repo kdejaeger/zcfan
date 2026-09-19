@@ -15,9 +15,9 @@
 #define MILLIC_TO_C(n) (n / 1000)
 #define FAN_CONTROL_FILE "/proc/acpi/ibm/fan"
 #define TEMP_INVALID INT_MIN
-#define TEMP_MIN INT_MIN + 1
-#define NS_IN_SEC 1000000000L  // 1 second in nanoseconds
-#define THRESHOLD_NS 200000000 // 0.2 seconds
+#define TEMP_MIN (INT_MIN + 1)
+#define NS_IN_SEC 1000000000L         // 1 second in nanoseconds
+#define RESUME_THRESHOLD_NS 200000000 // 0.2 seconds
 
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
@@ -38,10 +38,10 @@
 #define CONFIG_MAX_STRLEN 15
 #define S_CONFIG_MAX_STRLEN STR(CONFIG_MAX_STRLEN)
 
-#define MAX_IGNORED_SENSORS 1024
+#define MAX_IGNORED_SENSOR_NAMES 1024
 #define SENSOR_NAME_MAX 256
-static char ignored_sensors_arr[MAX_IGNORED_SENSORS][SENSOR_NAME_MAX];
-static size_t num_to_ignore_sensors = 0;
+static char ignored_sensor_names[MAX_IGNORED_SENSOR_NAMES][SENSOR_NAME_MAX];
+static size_t num_ignored_sensor_names = 0;
 
 #define MAX_SENSOR_FDS 4096
 /* Relative to /sys/class/hwmon: "hwmon4294967295/temp2147483647_input" fits */
@@ -67,8 +67,11 @@ struct Sensor {
 struct SensorSet {
     struct Sensor sensors[MAX_SENSOR_FDS];
     size_t num_sensor_fds;
-    size_t num_cpu_temp_sensors;
-    size_t num_cpu_core_sensors;
+    /* Primary control inputs (EC and per-core readings). If a set has
+     * none, every readable sensor feeds the average as a last resort. */
+    size_t num_control_sensors;
+    /* Per-core die readings among the control sensors. */
+    size_t num_core_sensors;
     size_t num_ignored_sensors;
     /* False when the scan could not be completed (failed open, readdir
      * error, overflow); such a snapshot must not replace the active set. A
@@ -99,14 +102,19 @@ static struct Rule rules[] = {
 static struct timespec last_watchdog_ping = {0, 0};
 static time_t watchdog_secs = DEFAULT_WATCHDOG_SECS;
 static int temp_hysteresis = 20;
-static const unsigned int tick_hysteresis = 3;
+/* Ticks a freshly engaged level is held before it may move again. */
+static const unsigned int hold_ticks = 3;
+/* From this temperature the firmware's critical-shutdown trip is close
+ * enough that the fan must not wait out the debounce, and must not be
+ * reduced while the reading persists (see set_fan_level()). */
+#define FAN_PANIC_TEMP_C 95
 static char output_buf[512];
 static const struct Rule *current_rule = NULL;
 static unsigned int level_ticks[FAN_INVALID];
 static volatile sig_atomic_t run = 1;
 static volatile sig_atomic_t pending_sleep = 0;
 static volatile sig_atomic_t pending_resume = 0;
-static int first_tick = 1; /* Stop running if errors are immediate */
+static bool first_tick = true; /* Stop running if errors are immediate */
 
 enum resume_state {
     RESUME_NOT_DETECTED,
@@ -145,7 +153,7 @@ static enum resume_state detect_suspend(void) {
     monotonic_prev = monotonic_now;
     boottime_prev = boottime_now;
 
-    return delta_boottime > delta_monotonic + THRESHOLD_NS
+    return delta_boottime > delta_monotonic + RESUME_THRESHOLD_NS
                ? RESUME_DETECTED
                : RESUME_NOT_DETECTED;
 }
@@ -154,10 +162,10 @@ static void fscanf_ignore_sensor(FILE *f, long pos) {
     char sensor_name[SENSOR_NAME_MAX];
     int ret = fscanf(f, "ignore_sensor %255s ", sensor_name);
     if (ret == 1) {
-        expect(num_to_ignore_sensors < MAX_IGNORED_SENSORS);
-        snprintf(ignored_sensors_arr[num_to_ignore_sensors], SENSOR_NAME_MAX,
-                 "%s", sensor_name);
-        num_to_ignore_sensors++;
+        expect(num_ignored_sensor_names < MAX_IGNORED_SENSOR_NAMES);
+        snprintf(ignored_sensor_names[num_ignored_sensor_names],
+                 SENSOR_NAME_MAX, "%s", sensor_name);
+        num_ignored_sensor_names++;
     } else {
         expect(fseek(f, pos, SEEK_SET) == 0);
     }
@@ -181,23 +189,23 @@ static bool is_sensor_name_ignored(DIR *sensor_dir) {
     char sensor_name[SENSOR_NAME_MAX];
     if (!read_sensor_file(sensor_dir, "name", sensor_name, sizeof(sensor_name)))
         return false;
-    for (size_t i = 0; i < num_to_ignore_sensors; i++) {
-        if (strcmp(sensor_name, ignored_sensors_arr[i]) == 0)
+    for (size_t i = 0; i < num_ignored_sensor_names; i++) {
+        if (strcmp(sensor_name, ignored_sensor_names[i]) == 0)
             return true;
     }
     return false;
 }
 
-static int full_speed_supported(void) {
+static bool full_speed_supported(void) {
     FILE *f = fopen(FAN_CONTROL_FILE, "re");
     char line[256]; // If exceeded, we'll just read again
-    int found = 0;
+    bool found = false;
 
     expect(f);
 
     while (fgets(line, sizeof(line), f) != NULL) {
         if (strstr(line, "full-speed") != NULL) {
-            found = 1;
+            found = true;
             break;
         }
     }
@@ -300,9 +308,9 @@ static void add_sensor_fd(struct SensorSet *set, DIR *sensor_dir,
                        sensor_file->d_name);
     expect(ret >= 0 && (size_t)ret < sizeof(sensor->path));
     if (kind == SENSOR_CPU_CORE)
-        set->num_cpu_core_sensors++;
+        set->num_core_sensors++;
     if (kind != SENSOR_OTHER)
-        set->num_cpu_temp_sensors++;
+        set->num_control_sensors++;
 }
 
 static void add_sensor_fds(struct SensorSet *set, DIR *sensor_dir,
@@ -433,8 +441,8 @@ static void refresh_sensors(void) {
         *cur = *scratch;
         info(
             "Sensor set changed: %zu sensors (%zu CPU core, %zu non-core CPU)\n",
-            cur->num_sensor_fds, cur->num_cpu_core_sensors,
-            cur->num_cpu_temp_sensors - cur->num_cpu_core_sensors);
+            cur->num_sensor_fds, cur->num_core_sensors,
+            cur->num_control_sensors - cur->num_core_sensors);
     } else {
         /* Failed or partial scan, or nothing changed: discard the scratch
          * set and keep the active one. */
@@ -455,14 +463,31 @@ static int read_temp_fd(int fd) {
     return (sscanf(buf, "%d", &val) == 1) ? val : TEMP_INVALID;
 }
 
-static int get_average_temp(void) {
+/* The two fan-control inputs, read once per tick. average_temp is the mean
+ * of the selected (core) readings and decides level reductions: the ACPI/EC
+ * reading lags the die and must not keep the fan spinning after the cores
+ * have cooled. control_temp folds in the ACPI/EC reading and decides level
+ * engagement, the debounce accounting, and the panic path: it is what the
+ * platform's critical-shutdown trip reacts to. */
+struct FanTemps {
+    int average_temp;
+    int control_temp;
+    /* True only when average_temp is a genuine per-core average. Without
+     * one there is no die-vs-EC lag to compensate for, so reductions
+     * follow the control temperature: average_temp is set equal to it
+     * when readable, and set_fan_level() falls back to it when the core
+     * average is unreadable. */
+    bool average_is_core;
+};
+
+static struct FanTemps get_fan_temps(void) {
     int64_t temp_sum = 0;
     size_t num_valid_temps = 0;
     int cpu_max = TEMP_INVALID;
     enum SensorKind selected_kind = SENSOR_OTHER;
-    if (sensor_set.num_cpu_core_sensors > 0)
+    if (sensor_set.num_core_sensors > 0)
         selected_kind = SENSOR_CPU_CORE;
-    else if (sensor_set.num_cpu_temp_sensors > 0)
+    else if (sensor_set.num_control_sensors > 0)
         selected_kind = SENSOR_CPU;
 
     for (size_t i = 0; i < sensor_set.num_sensor_fds; i++) {
@@ -482,20 +507,29 @@ static int get_average_temp(void) {
         num_valid_temps++;
     }
 
+    struct FanTemps temps = {TEMP_INVALID, TEMP_INVALID, false};
     if (num_valid_temps == 0 && cpu_max == TEMP_INVALID) {
         err("Couldn't find any valid temperature\n");
         exit_if_first_tick();
-        return TEMP_INVALID;
+        return temps;
     }
 
-    /* Fan-control temperature: the maximum of the core average and the
-     * ACPI/EC sensor reading. */
-    int average_temp = TEMP_INVALID;
     if (num_valid_temps > 0)
-        average_temp = MILLIC_TO_C((int)(temp_sum / (int64_t)num_valid_temps));
+        temps.average_temp =
+            MILLIC_TO_C((int)(temp_sum / (int64_t)num_valid_temps));
     if (cpu_max != TEMP_INVALID)
         cpu_max = MILLIC_TO_C(cpu_max);
-    return cpu_max > average_temp ? cpu_max : average_temp;
+    temps.control_temp =
+        cpu_max > temps.average_temp ? cpu_max : temps.average_temp;
+    /* Without a genuine core average there is no die-vs-EC lag to
+     * compensate for, so reductions follow the control temperature: the
+     * ACPI/EC reading (or the best available readings) drives both
+     * directions. */
+    temps.average_is_core =
+        selected_kind == SENSOR_CPU_CORE && num_valid_temps > 0;
+    if (!temps.average_is_core && temps.average_temp != TEMP_INVALID)
+        temps.average_temp = temps.control_temp;
+    return temps;
 }
 
 #define write_fan_level(level) write_fan("level", level)
@@ -539,36 +573,59 @@ enum set_fan_status {
     FAN_LEVEL_INVALID,
 };
 
-static enum set_fan_status set_fan_level(void) {
-    int average_temp = get_average_temp(), temp_penalty = 0;
-    static unsigned int tick_penalty = tick_hysteresis;
+/* Transition logs are labeled by the input that decided the level: the
+ * ACPI/EC control reading when raising and whenever no core average drove
+ * the decision; the core average for ordinary reductions. */
+static const char *fan_source(bool moving_up, bool average_is_core) {
+    return moving_up || !average_is_core ? "Temperature" : "Core average";
+}
 
-    if (tick_penalty > 0) {
-        tick_penalty--;
+static enum set_fan_status set_fan_level(void) {
+    struct FanTemps temps = get_fan_temps();
+    int control_temp = temps.control_temp;
+    int threshold_discount = 0;
+    static unsigned int hold_ticks_remaining = hold_ticks;
+
+    if (hold_ticks_remaining > 0) {
+        hold_ticks_remaining--;
     }
 
-    if (average_temp == TEMP_INVALID) {
+    if (control_temp == TEMP_INVALID) {
         write_fan_level("full-speed");
         return FAN_LEVEL_INVALID;
     }
 
+    /* Level reductions follow the core average alone: the ACPI/EC reading
+     * lags the die and must not keep the fan spinning after the cores have
+     * cooled. If the core average is unreadable the ACPI/EC reading drives
+     * both directions. The panic band needs no exception here: maximum is
+     * held outright at or above the band threshold (see below), independent
+     * of any configured thresholds. */
+    int reduction_temp = temps.average_temp;
+    if (reduction_temp == TEMP_INVALID)
+        reduction_temp = control_temp;
+
     /* Panic: at 95C we are only a few degrees below the firmware's critical
      * trip point (typically 98C-105C on ThinkPads, fed by the ACPI/EC
      * sensor), so engage maximum immediately rather than waiting out the
-     * debounce. */
-    if (average_temp >= 95 && current_rule != rules + FAN_MAX) {
+     * debounce, and never reduce while the reading persists: a custom
+     * threshold can sit above the band, so the hold must not rely on
+     * discounted thresholds. */
+    if (control_temp >= FAN_PANIC_TEMP_C) {
+        if (current_rule == rules + FAN_MAX)
+            return FAN_LEVEL_NOT_SET;
         const struct Rule *rule = rules + FAN_MAX;
         current_rule = rule;
-        tick_penalty = tick_hysteresis;
-        printf("[FAN] Temperature now %dC, at or above panic threshold 95C, "
+        hold_ticks_remaining = hold_ticks;
+        printf("[FAN] Temperature now %dC, at or above panic threshold %dC, "
                "fan set to %s\n",
-               average_temp, rule->name);
+               control_temp, FAN_PANIC_TEMP_C, rule->name);
         write_fan_level(rule->tpacpi_level);
         return FAN_LEVEL_SET;
     }
 
     for (size_t i = 0; i < FAN_INVALID; i++) {
-        if (average_temp > rules[i].threshold)
+        if (control_temp > rules[i].threshold)
             level_ticks[i]++;
         else
             level_ticks[i] = 0;
@@ -576,29 +633,51 @@ static enum set_fan_status set_fan_level(void) {
 
     for (size_t i = 0; i < FAN_INVALID; i++) {
         const struct Rule *rule = rules + i;
+        /* Engagement follows the control temperature; reductions the core
+         * average. */
+        bool moving_up = current_rule == NULL || rule < current_rule;
+        int rule_temp = moving_up ? control_temp : reduction_temp;
 
         if (rule == current_rule) {
-            if (tick_penalty) {
-                // Must wait longer until able to move down levels
+            if (hold_ticks_remaining) {
+                // A freshly engaged level is held before it may move again
                 return FAN_LEVEL_NOT_SET;
             }
-            temp_penalty = temp_hysteresis;
+            /* Thresholds at or below the current level are discounted by
+             * the hysteresis, so the fan does not flap between adjacent
+             * levels when the reading hovers near a threshold. */
+            threshold_discount = temp_hysteresis;
         }
 
-        if (rule->threshold < temp_penalty ||
-            (rule->threshold - temp_penalty) < average_temp) {
+        /* Discounting TEMP_MIN would overflow, so the floor matches via the
+         * first clause. */
+        if (rule->threshold < threshold_discount ||
+            (rule->threshold - threshold_discount) < rule_temp) {
             if (rule != current_rule) {
-                bool moving_up = current_rule == NULL || rule < current_rule;
                 if (moving_up &&
                     level_ticks[i] < (unsigned int)rule->debounce_secs) {
-                    // Must stay above the threshold for debounce_secs before
-                    // engaging a higher fan level
-                    return FAN_LEVEL_NOT_SET;
+                    if (current_rule == NULL) {
+                        // Must stay above the threshold for debounce_secs
+                        // before engaging a higher fan level
+                        return FAN_LEVEL_NOT_SET;
+                    }
+                    /* A pending raise must not block reductions: keep
+                     * scanning so lower rules can still be evaluated
+                     * against the core average. */
+                    continue;
                 }
+                /* A reduction must not carry stale up-debounce credit: the
+                 * departed level re-arms only after a fresh observation, so
+                 * a control temperature that lingers above its threshold
+                 * (the ACPI/EC reading decaying after a burst) cannot
+                 * re-engage it instantly. */
+                if (!moving_up)
+                    memset(level_ticks, 0, sizeof(level_ticks));
                 current_rule = rule;
-                tick_penalty = tick_hysteresis;
-                printf("[FAN] Average temperature now %dC, fan set to %s\n",
-                       average_temp, rule->name);
+                hold_ticks_remaining = hold_ticks;
+                printf("[FAN] %s now %dC, fan set to %s\n",
+                       fan_source(moving_up, temps.average_is_core), rule_temp,
+                       rule->name);
                 write_fan_level(rule->tpacpi_level);
                 return FAN_LEVEL_SET;
             }
@@ -673,6 +752,8 @@ static void maybe_ping_watchdog(void) {
 }
 
 #define CONFIG_PATH "/etc/zcfan.conf"
+/* Overridable so tests can point at a synthetic config file. */
+static const char *config_path = CONFIG_PATH;
 #define fscanf_int_for_key(f, pos, name, dest)                                 \
     do {                                                                       \
         int val;                                                               \
@@ -697,10 +778,10 @@ static void maybe_ping_watchdog(void) {
 static void get_config(void) {
     FILE *f;
 
-    f = fopen(CONFIG_PATH, "re");
+    f = fopen(config_path, "re");
     if (!f) {
         if (errno != ENOENT) {
-            err("%s: fopen: %s\n", CONFIG_PATH, strerror(errno));
+            err("%s: fopen: %s\n", config_path, strerror(errno));
             exit_if_first_tick();
         }
         return;
@@ -708,7 +789,6 @@ static void get_config(void) {
 
     while (!feof(f)) {
         long pos = ftell(f);
-        int ch;
         expect(pos >= 0);
         fscanf_int_for_key(f, pos, "max_temp", rules[FAN_MAX].threshold);
         fscanf_int_for_key(f, pos, "med_temp", rules[FAN_MED].threshold);
@@ -726,6 +806,7 @@ static void get_config(void) {
         fscanf_str_for_key(f, pos, "low_level", rules[FAN_LOW].tpacpi_level);
         fscanf_ignore_sensor(f, pos);
         if (ftell(f) == pos) {
+            int ch;
             while ((ch = fgetc(f)) != EOF && ch != '\n') {}
         }
     }
@@ -740,7 +821,7 @@ static void get_config(void) {
     if (watchdog_secs < WATCHDOG_GRACE_PERIOD_SECS ||
         watchdog_secs > DEFAULT_WATCHDOG_SECS) {
         err("%s: value for the watchdog_secs directive has to be between %d and %d\n",
-            CONFIG_PATH, WATCHDOG_GRACE_PERIOD_SECS, DEFAULT_WATCHDOG_SECS);
+            config_path, WATCHDOG_GRACE_PERIOD_SECS, DEFAULT_WATCHDOG_SECS);
         exit(1);
     }
 
@@ -753,12 +834,12 @@ static void print_thresholds(void) {
         printf("[CFG] At %dC fan is set to %s (after %ds above threshold)\n",
                rule->threshold, rule->name, rule->debounce_secs);
     }
-    if (sensor_set.num_cpu_core_sensors > 0) {
+    if (sensor_set.num_core_sensors > 0) {
         printf("[CFG] Averaging %zu CPU core sensors\n",
-               sensor_set.num_cpu_core_sensors);
-    } else if (sensor_set.num_cpu_temp_sensors > 0) {
+               sensor_set.num_core_sensors);
+    } else if (sensor_set.num_control_sensors > 0) {
         printf("[CFG] Averaging %zu CPU sensors\n",
-               sensor_set.num_cpu_temp_sensors);
+               sensor_set.num_control_sensors);
     } else {
         printf("[CFG] Averaging all %zu temperature sensors\n",
                sensor_set.num_sensor_fds);
@@ -823,31 +904,31 @@ int main(int argc, char *argv[]) {
     }
     print_thresholds();
 
-    int fan_control_enabled = 1;
+    bool fan_control_enabled = true;
 
     while (run) {
         refresh_sensors();
         if (fan_control_enabled) {
-            enum set_fan_status set = set_fan_level();
-            if (set != FAN_LEVEL_SET) {
+            enum set_fan_status status = set_fan_level();
+            if (status != FAN_LEVEL_SET) {
                 maybe_ping_watchdog();
             }
         }
         if (run) {
             sleep(1);
-            first_tick = 0;
+            first_tick = false;
         }
         if (pending_sleep) {
             pending_sleep = 0;
             info("Fan control disabled for sleep\n");
             if (write_fan_level("auto") == 0)
                 write_watchdog_timeout(0);
-            fan_control_enabled = 0;
+            fan_control_enabled = false;
         }
         if (pending_resume) {
             pending_resume = 0;
             info("Fan control enabled for resume\n");
-            fan_control_enabled = 1;
+            fan_control_enabled = true;
             /* current_rule can still be NULL if we resumed during the
              * startup debounce window; the next control tick engages a
              * level and writes it. */

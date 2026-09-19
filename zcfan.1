@@ -13,9 +13,14 @@ readings are preferred, with a fallback to all readable temperature inputs
 The fan-control temperature is the maximum of the core average and the ACPI/EC
 sensor reading, the same reading the platform's critical-shutdown trip reacts
 to. Die/package readings are deliberately excluded: they spike hotter and
-faster than the trip sensor. Unavailable and non-positive readings are
-ignored. The set of readable, non-ignored temperature inputs is re-checked
-roughly once per second, so hwmon drivers that register after
+faster than the trip sensor. The ACPI/EC reading normally only raises the fan
+(engagement and the 95C panic, which also holds maximum): level reductions
+follow the core average, except when no genuine core average exists (then
+the fan-control temperature decides) and in the 95C panic band (then no
+reduction is considered at all: maximum is held outright). Unavailable and
+non-positive readings are ignored. The
+set of readable, non-ignored temperature inputs is re-checked roughly once per
+second, so hwmon drivers that register after
 .B zcfan
 has started (for example, coretemp being autoloaded by udev during boot) are
 picked up automatically.
@@ -58,9 +63,10 @@ low_temp 55
 .EE
 .RE
 
-If no trip temperature is reached, the fan will be turned off.
+If no trip temperature is reached (and the reading is below the 95C panic
+band), the fan will be turned off.
 
-The number of consecutive seconds the average temperature must stay above a
+The number of consecutive seconds the fan-control temperature must stay above a
 level's trip temperature before that level is engaged can be set per level with
 the
 .I max_debounce_secs
@@ -82,9 +88,12 @@ low_debounce_secs 5
 
 We will only reduce the fan level again once:
 .IP "1." 3
-The average temperature is now at least
+The core average is at least
 .I temp_hysteresis
-Celsius below the trip point (default 20C), and
+Celsius below the trip point (default 20C) -- no reduction is considered at
+all in the 95C panic band (maximum is held outright), and when no genuine
+core average is available the fan-control temperature decides instead (see
+the sensor description above), and
 .IP "2." 3
 At least 3 seconds have elapsed since the initial trip.
 .PP
@@ -93,8 +102,9 @@ This avoids unnecessary fluctuations in fan speed.
 
 .SS DEBOUNCE
 
-Conversely, before we engage a higher fan level, the average temperature must
-remain above that level's trip point for a number of consecutive seconds set by
+Conversely, before we engage a higher fan level, the fan-control temperature
+must remain above that level's trip point for a number of consecutive seconds
+set by
 .I low_debounce_secs
 ,
 .I med_debounce_secs
@@ -104,7 +114,8 @@ remain above that level's trip point for a number of consecutive seconds set by
 spinning the fans up. A value of 0 or 1 engages the level immediately.
 
 The debounce is bypassed at 95C and above: the maximum fan level is engaged
-immediately, to stay clear of the firmware's critical shutdown temperature.
+immediately and held while the temperature stays there, to stay clear of the
+firmware's critical shutdown temperature.
 
 .SS WATCHDOG
 
