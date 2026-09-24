@@ -105,6 +105,31 @@ static void read_fan_log(const char *path, FILE *saved_stdout, char *line,
     expect(fclose(log) == 0);
 }
 
+/* Same capture pattern as capture_fan_log()/read_fan_log(), but for stderr,
+ * where info()/err() write. Only expect() failures write to stderr besides
+ * the code under test, and those abort anyway, so a captured window holds
+ * exactly the line(s) the code under test emitted. */
+static FILE *capture_stderr_log(const char *path) {
+    fflush(stderr);
+    FILE *saved_stderr = stderr;
+    stderr = fopen(path, "w");
+    expect(stderr != NULL);
+    return saved_stderr;
+}
+
+static void read_stderr_log(const char *path, FILE *saved_stderr, char *line,
+                            size_t size) {
+    fflush(stderr);
+    expect(fclose(stderr) == 0);
+    stderr = saved_stderr;
+    FILE *log = fopen(path, "re");
+    expect(log != NULL);
+    expect(fgets(line, (int)size, log) != NULL);
+    char extra[4];
+    expect(fgets(extra, (int)sizeof(extra), log) == NULL); /* one line only */
+    expect(fclose(log) == 0);
+}
+
 static void rm_rf(const char *path) {
     DIR *dir = opendir(path);
     if (dir != NULL) {
@@ -596,6 +621,111 @@ int main(void) {
     rules[FAN_MAX].threshold = 90;
     config_path = CONFIG_PATH;
 
+    /* --- Per-fan runaway detection and healing ---
+     *
+     * The runaway is detected while the off level is held: a fan input
+     * above FAN_SELF_RUNNING_RPM for two consecutive refreshes. The
+     * excursion writes the maximum level, waits, and re-asserts the held
+     * level. By default the fan-control file here is /proc (writes fail),
+     * so the failure path is what these tests see first; a fixture file
+     * stand-in is swapped in further down for the success-path and
+     * exhaustion assertions. The thinkpad hwmon device (hwmon1) gets a
+     * fan input for these tests; nothing else reads it (sensor discovery
+     * only opens temp*_input files), and the fixture is torn down right
+     * after. */
+
+    /* No fan inputs: nothing to detect, no crash, no state churn. */
+    current_rule = rules + FAN_OFF;
+    reassert_fan_control(); /* must not crash with no fan inputs */
+    CHECK(maybe_fix_runaway_fan() == false);
+
+    /* A fan spinning at runaway speed with failing writes: the first
+     * refresh only confirms, the second attempts the excursion, which
+     * fails and must NOT consume an attempt. The excursion error goes to
+     * stderr (uncaptured); the return value stays false every call. */
+    make_temp("hwmon1", "fan1_input", NULL, 2500);
+    CHECK(maybe_fix_runaway_fan() == false); /* first sight: confirm only */
+    for (unsigned int i = 0; i <= FAN_RUNAWAY_RETRY_TICKS * 3; i++) {
+        CHECK(maybe_fix_runaway_fan() == false);
+    }
+
+    /* Confirmation state is dropped when the held level is not off: an
+     * observation before leaving off must not survive the round trip.
+     * With failing writes the return value cannot distinguish a
+     * confirmation-only refresh from a failed excursion attempt, so the
+     * boundary is asserted in the fixture success path further down. */
+    current_rule = rules + FAN_LOW;
+    CHECK(maybe_fix_runaway_fan() == false); /* no off gate: state dropped */
+    current_rule = rules + FAN_OFF;
+    CHECK(maybe_fix_runaway_fan() == false); /* must re-confirm */
+    CHECK(maybe_fix_runaway_fan() == false); /* excursion attempt, fails */
+    for (unsigned int i = 0; i < FAN_RUNAWAY_RETRY_TICKS; i++) {
+        CHECK(maybe_fix_runaway_fan() == false); /* drain the backoff */
+    }
+
+    /* Success path: point the fan-control file at a fixture file so the
+     * excursion write succeeds. The excursion consumes attempt 1, waits
+     * out the retry spacing, consumes attempt 2; the third consumes the
+     * last attempt, and the refresh after it exhausts the episode: one
+     * stderr abandonment line, then holding. */
+    char fan_control_fixture[640];
+    expect(snprintf(fan_control_fixture, sizeof(fan_control_fixture),
+                    "%s/fan-control", fixture_root) > 0);
+    write_file(fan_control_fixture, "");
+    fan_control_file = fan_control_fixture;
+    saved_stdout = capture_fan_log(log_path);
+    CHECK(maybe_fix_runaway_fan() == true); /* excursion 1 */
+    read_fan_log(log_path, saved_stdout, log_line, sizeof(log_line));
+    CHECK(strstr(log_line,
+                 "Fan self-running at 2500 RPM while level off is commanded") !=
+          NULL);
+    for (unsigned int i = 0; i < FAN_RUNAWAY_RETRY_TICKS; i++) {
+        CHECK(maybe_fix_runaway_fan() == false);
+    }
+    CHECK(maybe_fix_runaway_fan() == true); /* excursion 2 */
+    for (unsigned int i = 0; i < FAN_RUNAWAY_RETRY_TICKS; i++) {
+        CHECK(maybe_fix_runaway_fan() == false);
+    }
+    CHECK(maybe_fix_runaway_fan() == true); /* excursion 3: budget spent */
+    /* The refresh after the last excursion exhausts the episode: no
+     * excursion, one abandonment line on stderr, then holding. */
+    char err_path[640];
+    char err_line[256];
+    expect(snprintf(err_path, sizeof(err_path), "%s/err-log", fixture_root) >
+           0);
+    FILE *saved_err = capture_stderr_log(err_path);
+    CHECK(maybe_fix_runaway_fan() == false);
+    read_stderr_log(err_path, saved_err, err_line, sizeof(err_line));
+    CHECK(strstr(err_line,
+                 "Fan still self-running at the maximum level after 3 "
+                 "excursion(s)") != NULL);
+    for (unsigned int i = 0; i < FAN_RUNAWAY_RETRY_TICKS * 2; i++) {
+        CHECK(maybe_fix_runaway_fan() == false); /* holding, silent */
+    }
+
+    /* The fan stops: the hold lifts with one stderr re-arm line, and a
+     * fresh episode starts from scratch. The gate round trip (off →
+     * low → off) must also drop the confirmation: the first call back
+     * at off confirms only (false), despite the pre-trip observation. */
+    make_temp("hwmon1", "fan1_input", NULL, 0);
+    saved_err = capture_stderr_log(err_path);
+    CHECK(maybe_fix_runaway_fan() == false);
+    read_stderr_log(err_path, saved_err, err_line, sizeof(err_line));
+    CHECK(strstr(err_line, "runaway handling re-armed") != NULL);
+    make_temp("hwmon1", "fan1_input", NULL, 2500);
+    CHECK(maybe_fix_runaway_fan() == false); /* re-armed: confirm again */
+    current_rule = rules + FAN_LOW;
+    CHECK(maybe_fix_runaway_fan() == false); /* gate drops confirmation */
+    current_rule = rules + FAN_OFF;
+    CHECK(maybe_fix_runaway_fan() == false); /* confirms again (m4) */
+    CHECK(maybe_fix_runaway_fan() == true);  /* fresh excursion 1 */
+
+    /* A fan at rest never triggers anything. */
+    make_temp("hwmon1", "fan1_input", NULL, 0);
+    CHECK(maybe_fix_runaway_fan() == false);
+    CHECK(maybe_fix_runaway_fan() == false);
+
+    fan_control_file = FAN_CONTROL_FILE;
     close_sensor_fds(&sensor_set);
     rm_rf(fixture_root);
 

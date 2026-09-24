@@ -76,6 +76,22 @@ The debounce is bypassed at 95C and above: the maximum fan level is engaged
 immediately and held while the temperature stays there, to stay clear of the
 firmware's critical shutdown temperature.
 
+### Self-running fans
+
+On some dual-fan models the EC can get stuck running one fan at its own idle
+speed even while zcfan holds the fan off and the fan-control status still
+reports manual control. At each periodic watchdog refresh while the fan is
+commanded off, zcfan checks the fan speed readings: a fan spinning above
+500 RPM across two consecutive refreshes is treated as self-running and
+cleared with a brief maximum-level excursion (the configured `max_level`,
+full-speed by default, followed by the held level), which resets the EC's
+per-fan state. Three excursions are completed per episode, spaced six
+watchdog refreshes apart; failed writes do not consume the attempt
+budget, so a persistently failing write keeps retrying. If the fan
+still does not stop, zcfan logs an error and leaves it alone until the
+fan stops (or its speed can no longer be read), after which healing
+re-arms automatically.
+
 ### Ignoring sensors
 
 If you have a faulty sensor, or a sensor that you otherwise want to ignore, you

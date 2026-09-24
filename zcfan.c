@@ -14,6 +14,8 @@
 
 #define MILLIC_TO_C(n) (n / 1000)
 #define FAN_CONTROL_FILE "/proc/acpi/ibm/fan"
+/* Overridable so tests can run against a synthetic fan-control file. */
+static const char *fan_control_file = FAN_CONTROL_FILE;
 #define TEMP_INVALID INT_MIN
 #define TEMP_MIN (INT_MIN + 1)
 #define NS_IN_SEC 1000000000L         // 1 second in nanoseconds
@@ -197,7 +199,7 @@ static bool is_sensor_name_ignored(DIR *sensor_dir) {
 }
 
 static bool full_speed_supported(void) {
-    FILE *f = fopen(FAN_CONTROL_FILE, "re");
+    FILE *f = fopen(fan_control_file, "re");
     char line[256]; // If exceeded, we'll just read again
     bool found = false;
 
@@ -535,11 +537,11 @@ static struct FanTemps get_fan_temps(void) {
 #define write_fan_level(level) write_fan("level", level)
 
 static int write_fan(const char *command, const char *value) {
-    FILE *f = fopen(FAN_CONTROL_FILE, "we");
+    FILE *f = fopen(fan_control_file, "we");
     int ret;
 
     if (!f) {
-        err("%s: fopen: %s%s\n", FAN_CONTROL_FILE, strerror(errno),
+        err("%s: fopen: %s%s\n", fan_control_file, strerror(errno),
             errno == ENOENT ? " (is thinkpad_acpi loaded?)" : "");
         exit_if_first_tick();
         return -errno;
@@ -691,13 +693,198 @@ static enum set_fan_status set_fan_level(void) {
 
 #define WATCHDOG_GRACE_PERIOD_SECS 2
 /* The EC can quietly drop manual fan control and resume its own automatic
- * management (observed on a dual-fan model as one fan spinning while the
- * other stays stopped at low temperatures). While zcfan holds a rule, the
- * EC's automatic control must stay disengaged: detect a revert and
- * re-assert the level. The status line reads "enabled" only while the EC's
- * automatic control is running; a held manual level shows "disabled". */
+ * management. Two distinct failure shapes have been observed:
+ *
+ * 1. The status line reads "enabled" while zcfan holds a level: the EC took
+ *    over as a whole. Re-assert the level.
+ *
+ * 2. On a dual-fan model (X1 Carbon Gen 14, kernel 7.2.6): the status line
+ *    still reads "disabled" (manual control held), zcfan commands level 0,
+ *    one fan obeys and stops, but the other keeps spinning at a steady
+ *    speed for hours at cool temperatures. The EC is running its own
+ *    policy on that fan alone while still reporting manual control, so a
+ *    status re-assert would never fire. An excursion to the maximum
+ *    fan level (the configured max_level, "full-speed" by default)
+ *    followed by the held level has been verified on hardware to clear
+ *    the stuck per-fan state. */
+
+/* Ticks spent above this RPM while the held level is off, for two
+ * consecutive watchdog refreshes, count as the per-fan runaway. */
+#define FAN_SELF_RUNNING_RPM 500
+/* A commanded fan needs a moment to spin down: require two consecutive
+ * refreshes before treating a spinning fan as runaway. */
+#define FAN_RUNAWAY_CONFIRM_TICKS 2
+/* Full-speed excursion attempts per runaway episode, spaced
+ * FAN_RUNAWAY_RETRY_TICKS + 1 watchdog refreshes apart (at the default
+ * watchdog_secs of 120, about 12 minutes); after the attempts are spent
+ * the episode is abandoned and logged until the fan stops. */
+#define FAN_RUNAWAY_MAX_EXCURSIONS 3
+#define FAN_RUNAWAY_RETRY_TICKS 5
+
+/* Read a sysfs attribute file at an absolute path. */
+static bool read_sensor_file_path(const char *path, char *buf,
+                                  size_t buf_size) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return false;
+    ssize_t len = read(fd, buf, buf_size - 1);
+    close(fd);
+    if (len <= 0)
+        return false;
+    buf[len] = '\0';
+    buf[strcspn(buf, "\n")] = '\0';
+    return true;
+}
+
+/* Highest RPM among the fan inputs of the thinkpad hwmon device, or 0 when
+ * none can be read. A single-fan model simply lacks fan2_input. */
+static int max_fan_rpm(void) {
+    int max_rpm = 0;
+    DIR *fans_dir = opendir(hwmon_root);
+    if (!fans_dir)
+        return 0;
+    const struct dirent *entry;
+    while ((entry = readdir(fans_dir)) != NULL) {
+        if (strncmp(entry->d_name, "hwmon", 5) != 0)
+            continue;
+        char path[80];
+        int ret = snprintf(path, sizeof(path), "%s/%s/name", hwmon_root,
+                           entry->d_name);
+        if (ret < 0 || (size_t)ret >= sizeof(path))
+            continue;
+        char driver_name[SENSOR_NAME_MAX];
+        if (!read_sensor_file_path(path, driver_name, sizeof(driver_name)) ||
+            strcmp(driver_name, "thinkpad") != 0)
+            continue;
+        for (int fan_num = 1; fan_num <= 2; fan_num++) {
+            ret = snprintf(path, sizeof(path), "%s/%s/fan%d_input", hwmon_root,
+                           entry->d_name, fan_num);
+            if (ret < 0 || (size_t)ret >= sizeof(path))
+                continue;
+            char rpm_buf[16];
+            if (!read_sensor_file_path(path, rpm_buf, sizeof(rpm_buf)))
+                continue;
+            int rpm = atoi(rpm_buf);
+            if (rpm > max_rpm)
+                max_rpm = rpm;
+        }
+    }
+    closedir(fans_dir);
+    return max_rpm;
+}
+
+/* Detect an uncommanded spinning fan and clear it with an excursion to
+ * the maximum fan level. Returns true only when a complete excursion
+ * (maximum level written, then the held level restored) succeeded.
+ *
+ * Called once per watchdog refresh. Any level above off has a legitimate
+ * spin speed above the runaway threshold, so detection is meaningful only
+ * while the off level is held; when another level is held, confirmation
+ * and retry spacing are dropped, but the attempt budget and the
+ * exhausted-hold survive: the stuck per-fan EC state is not expected to
+ * heal itself, and a reset budget would let temperature oscillation
+ * around a level threshold drive endless excursion loops. The excursion
+ * writes the configured max_level ("full-speed" by default), which has
+ * been verified on hardware to clear the EC's stuck per-fan state. */
+static bool maybe_fix_runaway_fan(void) {
+    /* Consecutive refreshes with a spinning fan while level 0 is held.
+     * Reset when no fan spins or the held level is not off. */
+    static int runaways_seen = 0;
+    /* Excursion attempts left in the current runaway episode. */
+    static unsigned int attempts_left = FAN_RUNAWAY_MAX_EXCURSIONS;
+    /* Watchdog refreshes until the next excursion attempt is allowed. */
+    static unsigned int retry_ticks = 0;
+    /* Set when the episode is exhausted; cleared when the runaway stops. */
+    static bool hold_until_stop = false;
+
+    if (current_rule != rules + FAN_OFF) {
+        /* Confirmation and retry spacing are only meaningful while the
+         * off level is held. */
+        runaways_seen = 0;
+        retry_ticks = 0;
+        return false;
+    }
+
+    int max_rpm = max_fan_rpm();
+    if (max_rpm <= FAN_SELF_RUNNING_RPM) {
+        /* No fan spins beyond the commanded stop: clean state. */
+        runaways_seen = 0;
+        attempts_left = FAN_RUNAWAY_MAX_EXCURSIONS;
+        retry_ticks = 0;
+        if (hold_until_stop) {
+            hold_until_stop = false;
+            info("Fan no longer self-running; runaway handling re-armed\n");
+        }
+        return false;
+    }
+
+    /* A fan spins beyond the commanded speed. Require confirmation across
+     * two consecutive refreshes before acting: a freshly commanded fan
+     * needs a moment to spin down before it reads as stopped. */
+    runaways_seen++;
+    if (runaways_seen < FAN_RUNAWAY_CONFIRM_TICKS)
+        return false;
+    if (hold_until_stop)
+        return false;
+    if (attempts_left == 0) {
+        hold_until_stop = true;
+        err("Fan still self-running at the maximum level after %d "
+            "excursion(s); leaving it alone until it stops\n",
+            FAN_RUNAWAY_MAX_EXCURSIONS);
+        return false;
+    }
+    if (retry_ticks > 0) {
+        retry_ticks--;
+        return false;
+    }
+
+    /* Runaway confirmed: clear the EC's per-fan state with a full-speed
+     * excursion (verified on hardware to reset the fan to the commanded
+     * level), then restore the held level. */
+    printf("[FAN] Fan self-running at %d RPM while level %s is commanded "
+           "(%u previous excursion(s))\n",
+           max_rpm, current_rule->name,
+           (unsigned)(FAN_RUNAWAY_MAX_EXCURSIONS - attempts_left));
+    int rc = write_fan("level", rules[FAN_MAX].tpacpi_level);
+    if (rc != 0) {
+        /* The excursion write failed: without it a restore would leave
+         * the EC in unknown territory, so back off without consuming an
+         * attempt and try again after the retry spacing. */
+        err("Fan runaway excursion write failed: %s\n", strerror(-rc));
+        retry_ticks = FAN_RUNAWAY_RETRY_TICKS;
+        return false;
+    }
+    /* Keep the excursion on the wire briefly before re-asserting, so
+     * the EC is guaranteed to see it; the daemon blocks for this
+     * second, which is safe: the fan is at the excursion level
+     * meanwhile. Retry if a signal interrupts the pause: restoring
+     * early could leave the excursion unseen by the EC. */
+    struct timespec pause = {1, 0};
+    while (nanosleep(&pause, &pause) == -1 && errno == EINTR) {}
+    rc = write_fan_level(current_rule->tpacpi_level);
+    if (rc != 0) {
+        /* The excursion level is on the wire, but the held level could
+         * not be restored. Treat the attempt as not spent: the fan still
+         * reads far above the commanded level, so after the retry
+         * spacing the whole excursion-and-restore sequence runs again.
+         * Consuming the attempt here could abandon the fan at the
+         * excursion level once the budget is spent. */
+        err("Fan runaway restore write failed: %s\n", strerror(-rc));
+        retry_ticks = FAN_RUNAWAY_RETRY_TICKS;
+        return false;
+    }
+    attempts_left--;
+    retry_ticks = FAN_RUNAWAY_RETRY_TICKS;
+    return true;
+}
+
 static void reassert_fan_control(void) {
-    FILE *f = fopen(FAN_CONTROL_FILE, "re");
+    /* Detect and heal the per-fan runaway (failure shape 2) before the
+     * status check: with the stuck state the status line keeps reading
+     * "disabled", so only the fan speeds reveal the problem. */
+    maybe_fix_runaway_fan();
+
+    FILE *f = fopen(fan_control_file, "re");
     char line[128];
     char status[sizeof("disabled")];
 
