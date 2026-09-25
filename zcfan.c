@@ -112,6 +112,28 @@ static const unsigned int hold_ticks = 3;
 #define FAN_PANIC_TEMP_C 95
 static char output_buf[512];
 static const struct Rule *current_rule = NULL;
+/* True while temperature acquisition failed for this tick and the
+ * invalid-temperature fail-safe commands full-speed. While active, the
+ * runaway healing and the held-level reassertions must not fight the
+ * fail-safe: rewriting the held level would undo the full-speed command,
+ * and the fan spinning under the fail-safe must not be read as a
+ * runaway. */
+static bool fail_safe_temps = false;
+/* True while the control temperature is at or above the panic threshold
+ * this tick. Like the fail-safe flag it is refreshed by set_fan_level()
+ * before the watchdog path runs in the same tick, and it keeps runaway
+ * healing from restoring a held level underneath the panic response. */
+static bool panic_temps = false;
+
+/* The level to keep on the wire: the held level, or the maximum level
+ * while the fail-safe or the panic response is in charge (both write the
+ * configured maximum; a failed engagement write leaves the bookkeeping at
+ * the old rule, so the reassertions must not undo the response). Callers
+ * must ensure current_rule is non-NULL. */
+static const char *held_level(void) {
+    return fail_safe_temps || panic_temps ? rules[FAN_MAX].tpacpi_level
+                                          : current_rule->tpacpi_level;
+}
 static unsigned int level_ticks[FAN_INVALID];
 static volatile sig_atomic_t run = 1;
 static volatile sig_atomic_t pending_sleep = 0;
@@ -452,6 +474,20 @@ static void refresh_sensors(void) {
     }
 }
 
+/* Parse a leading decimal integer like sscanf("%d")/atoi, but reject
+ * values outside int range: an out-of-range conversion is undefined
+ * behavior, and a faulty sensor must degrade to "unreadable" rather than
+ * produce garbage. Trailing text is ignored, as the old parsers did. */
+static bool parse_int_range(const char *buf, int *out) {
+    errno = 0;
+    char *end;
+    long val = strtol(buf, &end, 10);
+    if (end == buf || errno == ERANGE || val < INT_MIN || val > INT_MAX)
+        return false;
+    *out = (int)val;
+    return true;
+}
+
 /* The kernel supports reading new values without reopening the FD */
 static int read_temp_fd(int fd) {
     char buf[32];
@@ -462,15 +498,15 @@ static int read_temp_fd(int fd) {
         return TEMP_INVALID;
     buf[n] = '\0';
     int val;
-    return (sscanf(buf, "%d", &val) == 1) ? val : TEMP_INVALID;
+    return parse_int_range(buf, &val) ? val : TEMP_INVALID;
 }
 
 /* The two fan-control inputs, read once per tick. average_temp is the mean
- * of the selected (core) readings and decides level reductions: the ACPI/EC
- * reading lags the die and must not keep the fan spinning after the cores
- * have cooled. control_temp folds in the ACPI/EC reading and decides level
- * engagement, the debounce accounting, and the panic path: it is what the
- * platform's critical-shutdown trip reacts to. */
+ * of the preferred readable readings and decides level reductions: the
+ * ACPI/EC reading lags the die and must not keep the fan spinning after the
+ * cores have cooled. control_temp folds in the hottest CPU-level reading and
+ * decides level engagement, the debounce accounting, and the panic path: it
+ * is what the platform's critical-shutdown trip reacts to. */
 struct FanTemps {
     int average_temp;
     int control_temp;
@@ -486,35 +522,59 @@ static struct FanTemps get_fan_temps(void) {
     int64_t temp_sum = 0;
     size_t num_valid_temps = 0;
     int cpu_max = TEMP_INVALID;
+    /* Averaging prefers CPU-core readings, then other CPU-level readings,
+     * then everything: the preference is decided per tick from VALID
+     * readings, not discovery counts, so a discovered-but-unreadable
+     * preferred class falls through to readable inputs instead of
+     * degenerating into the invalid-temperature fail-safe. Die/package
+     * readings are only averaged when no CPU-level reading exists (see
+     * is_die_label): they spike hotter and faster than the trip sensor. */
+    static const enum SensorKind preference[] = {
+        SENSOR_CPU_CORE,
+        SENSOR_CPU,
+        SENSOR_OTHER,
+    };
     enum SensorKind selected_kind = SENSOR_OTHER;
-    if (sensor_set.num_core_sensors > 0)
-        selected_kind = SENSOR_CPU_CORE;
-    else if (sensor_set.num_control_sensors > 0)
-        selected_kind = SENSOR_CPU;
-
-    for (size_t i = 0; i < sensor_set.num_sensor_fds; i++) {
-        int temp = read_temp_fd(sensor_set.sensors[i].fd);
-        if (temp == TEMP_INVALID || temp <= 0)
-            continue;
-        /* Track the ACPI/EC sensor reading: the one the platform's
-         * critical-shutdown trip reacts to. Die/package readings are
-         * excluded (see is_die_label): they spike hotter and faster than
-         * the trip sensor. */
-        if (sensor_set.sensors[i].kind == SENSOR_CPU && temp > cpu_max)
-            cpu_max = temp;
-        if (selected_kind != SENSOR_OTHER &&
-            sensor_set.sensors[i].kind != selected_kind)
-            continue;
-        temp_sum += temp;
-        num_valid_temps++;
+    for (size_t p = 0; p < sizeof(preference) / sizeof(*preference); p++) {
+        selected_kind = preference[p];
+        temp_sum = 0;
+        num_valid_temps = 0;
+        for (size_t i = 0; i < sensor_set.num_sensor_fds; i++) {
+            int temp = read_temp_fd(sensor_set.sensors[i].fd);
+            if (temp == TEMP_INVALID || temp <= 0)
+                continue;
+            /* Track the hottest CPU-level reading: that is the class of
+             * reading the platform's critical-shutdown trip reacts to
+             * (the ACPI/EC sensor on most ThinkPads). Die/package readings
+             * are excluded (see is_die_label): they spike hotter and
+             * faster than the trip sensor. */
+            if (sensor_set.sensors[i].kind == SENSOR_CPU && temp > cpu_max)
+                cpu_max = temp;
+            if (selected_kind != SENSOR_OTHER &&
+                sensor_set.sensors[i].kind != selected_kind)
+                continue;
+            temp_sum += temp;
+            num_valid_temps++;
+        }
+        if (num_valid_temps > 0)
+            break;
     }
 
     struct FanTemps temps = {TEMP_INVALID, TEMP_INVALID, false};
+    /* Log only the transition into (and out of) a total outage: a
+     * persistent sensor failure would otherwise log once per second. */
+    static bool logged_no_valid_temps = false;
     if (num_valid_temps == 0 && cpu_max == TEMP_INVALID) {
-        err("Couldn't find any valid temperature\n");
+        /* The full-speed write itself is repeated on purpose: it is the
+         * safety floor. */
+        if (!logged_no_valid_temps) {
+            err("Couldn't find any valid temperature\n");
+            logged_no_valid_temps = true;
+        }
         exit_if_first_tick();
         return temps;
     }
+    logged_no_valid_temps = false;
 
     if (num_valid_temps > 0)
         temps.average_temp =
@@ -523,12 +583,11 @@ static struct FanTemps get_fan_temps(void) {
         cpu_max = MILLIC_TO_C(cpu_max);
     temps.control_temp =
         cpu_max > temps.average_temp ? cpu_max : temps.average_temp;
-    /* Without a genuine core average there is no die-vs-EC lag to
-     * compensate for, so reductions follow the control temperature: the
-     * ACPI/EC reading (or the best available readings) drives both
-     * directions. */
     temps.average_is_core =
         selected_kind == SENSOR_CPU_CORE && num_valid_temps > 0;
+    /* Without a genuine core average there is no die-vs-EC lag to
+     * compensate for, so reductions follow the control temperature: the
+     * hottest available readings drive both directions. */
     if (!temps.average_is_core && temps.average_temp != TEMP_INVALID)
         temps.average_temp = temps.control_temp;
     return temps;
@@ -593,8 +652,30 @@ static enum set_fan_status set_fan_level(void) {
     }
 
     if (control_temp == TEMP_INVALID) {
-        write_fan_level("full-speed");
+        fail_safe_temps = true;
+        /* The configured maximum level is the fail-safe floor: it has
+         * passed config validation (never "0"/"auto") and the "7"
+         * fallback, so this write also works on kernels without
+         * full-speed support. */
+        write_fan_level(rules[FAN_MAX].tpacpi_level);
         return FAN_LEVEL_INVALID;
+    }
+    panic_temps = control_temp >= FAN_PANIC_TEMP_C;
+    if (fail_safe_temps) {
+        /* Recovering from the invalid-temperature fail-safe: the wire
+         * holds the maximum level while the bookkeeping still holds a
+         * level that would never be re-written on its own. Restore it
+         * before re-evaluating thresholds -- unless the recovered
+         * temperature already demands the maximum (panic band), where the
+         * panic write below takes the wire directly. */
+        if (current_rule && !panic_temps) {
+            if (write_fan_level(current_rule->tpacpi_level) != 0)
+                /* Failed restore: keep the fail-safe active so the next
+                 * tick retries instead of trusting bookkeeping that no
+                 * longer matches the wire. */
+                return FAN_LEVEL_NOT_SET;
+        }
+        fail_safe_temps = false;
     }
 
     /* Level reductions follow the core average alone: the ACPI/EC reading
@@ -617,12 +698,16 @@ static enum set_fan_status set_fan_level(void) {
         if (current_rule == rules + FAN_MAX)
             return FAN_LEVEL_NOT_SET;
         const struct Rule *rule = rules + FAN_MAX;
+        /* Advance the recorded level only on a successful write: a failed
+         * panic write must leave the old rule in place, so the next tick
+         * retries instead of assuming maximum is already on the wire. */
+        if (write_fan_level(rule->tpacpi_level) != 0)
+            return FAN_LEVEL_NOT_SET;
         current_rule = rule;
         hold_ticks_remaining = hold_ticks;
         printf("[FAN] Temperature now %dC, at or above panic threshold %dC, "
                "fan set to %s\n",
                control_temp, FAN_PANIC_TEMP_C, rule->name);
-        write_fan_level(rule->tpacpi_level);
         return FAN_LEVEL_SET;
     }
 
@@ -673,6 +758,10 @@ static enum set_fan_status set_fan_level(void) {
                  * a control temperature that lingers above its threshold
                  * (the ACPI/EC reading decaying after a burst) cannot
                  * re-engage it instantly. */
+                if (write_fan_level(rule->tpacpi_level) != 0)
+                    /* Same as the panic path: only a successful write may
+                     * advance the recorded level. */
+                    return FAN_LEVEL_NOT_SET;
                 if (!moving_up)
                     memset(level_ticks, 0, sizeof(level_ticks));
                 current_rule = rule;
@@ -680,7 +769,6 @@ static enum set_fan_status set_fan_level(void) {
                 printf("[FAN] %s now %dC, fan set to %s\n",
                        fan_source(moving_up, temps.average_is_core), rule_temp,
                        rule->name);
-                write_fan_level(rule->tpacpi_level);
                 return FAN_LEVEL_SET;
             }
             return FAN_LEVEL_NOT_SET;
@@ -764,7 +852,9 @@ static int max_fan_rpm(void) {
             char rpm_buf[16];
             if (!read_sensor_file_path(path, rpm_buf, sizeof(rpm_buf)))
                 continue;
-            int rpm = atoi(rpm_buf);
+            int rpm;
+            if (!parse_int_range(rpm_buf, &rpm))
+                continue;
             if (rpm > max_rpm)
                 max_rpm = rpm;
         }
@@ -785,7 +875,12 @@ static int max_fan_rpm(void) {
  * heal itself, and a reset budget would let temperature oscillation
  * around a level threshold drive endless excursion loops. The excursion
  * writes the configured max_level ("full-speed" by default), which has
- * been verified on hardware to clear the EC's stuck per-fan state. */
+ * been verified on hardware to clear the EC's stuck per-fan state.
+ *
+ * While the invalid-temperature fail-safe holds (fail_safe_temps) or the
+ * panic band is active (panic_temps), healing is suspended entirely: the
+ * fail-safe/panic response commands the maximum level, so a spinning fan
+ * is expected, and restoring the held off level would fight the response. */
 static bool maybe_fix_runaway_fan(void) {
     /* Consecutive refreshes with a spinning fan while level 0 is held.
      * Reset when no fan spins or the held level is not off. */
@@ -797,9 +892,10 @@ static bool maybe_fix_runaway_fan(void) {
     /* Set when the episode is exhausted; cleared when the runaway stops. */
     static bool hold_until_stop = false;
 
-    if (current_rule != rules + FAN_OFF) {
+    if (current_rule != rules + FAN_OFF || fail_safe_temps || panic_temps) {
         /* Confirmation and retry spacing are only meaningful while the
-         * off level is held. */
+         * off level is held, with no fail-safe in charge and no panic
+         * response active. */
         runaways_seen = 0;
         retry_ticks = 0;
         return false;
@@ -860,7 +956,13 @@ static bool maybe_fix_runaway_fan(void) {
      * meanwhile. Retry if a signal interrupts the pause: restoring
      * early could leave the excursion unseen by the EC. */
     struct timespec pause = {1, 0};
-    while (nanosleep(&pause, &pause) == -1 && errno == EINTR) {}
+    while (nanosleep(&pause, &pause) == -1 && errno == EINTR) {
+        /* Suspend arrived mid-excursion: the EC loses manual state anyway,
+         * so finish promptly instead of spending the remaining pause past
+         * the sleep service's one-second wait. */
+        if (pending_sleep)
+            break;
+    }
     rc = write_fan_level(current_rule->tpacpi_level);
     if (rc != 0) {
         /* The excursion level is on the wire, but the held level could
@@ -896,7 +998,7 @@ static void reassert_fan_control(void) {
             printf("[FAN] EC reverted to automatic fan control, re-asserting "
                    "%s\n",
                    current_rule->name);
-            write_fan_level(current_rule->tpacpi_level);
+            write_fan_level(held_level());
             break;
         }
     }
@@ -919,7 +1021,7 @@ static void maybe_ping_watchdog(void) {
         // revert to "auto".
         if (current_rule) {
             info("Clock jump detected, possible resume. Rewriting fan level\n");
-            write_fan_level(current_rule->tpacpi_level);
+            write_fan_level(held_level());
         }
     }
 
@@ -1012,6 +1114,25 @@ static void get_config(void) {
         exit(1);
     }
 
+    /* "0" and "auto" would make the panic path and the runaway excursion
+     * command the fan to stop or hand control back to the EC exactly when
+     * the machine is hottest. */
+    if (strcmp(rules[FAN_MAX].tpacpi_level, "0") == 0 ||
+        strcmp(rules[FAN_MAX].tpacpi_level, "auto") == 0) {
+        err("%s: max_level \"%s\" would defeat the panic and runaway-safety paths\n",
+            config_path, rules[FAN_MAX].tpacpi_level);
+        exit(1);
+    }
+
+    /* The threshold discount is subtracted from rule thresholds: a
+     * negative hysteresis raises reduced thresholds, and an enormous one
+     * overflows the subtraction. More than 100C is nonsense anyway. */
+    if (temp_hysteresis < 0 || temp_hysteresis > 100) {
+        err("%s: value for the temp_hysteresis directive has to be between 0 and 100\n",
+            config_path);
+        exit(1);
+    }
+
     fclose(f);
 }
 
@@ -1076,7 +1197,11 @@ int main(int argc, char *argv[]) {
 
     expect(setvbuf(stdout, output_buf, _IOLBF, sizeof(output_buf)) == 0);
 
-    if (!full_speed_supported()) {
+    if (!full_speed_supported() &&
+        strcmp(rules[FAN_MAX].tpacpi_level, "full-speed") == 0) {
+        /* Only the default level is replaced when full-speed is not
+         * supported: an explicitly configured max_level is the user's
+         * choice and is not silently overridden. */
         err("level \"full-speed\" not supported, using level 7\n");
         strncpy(rules[FAN_MAX].tpacpi_level, "7", CONFIG_MAX_STRLEN);
         rules[FAN_MAX].tpacpi_level[CONFIG_MAX_STRLEN] = '\0';
@@ -1108,6 +1233,9 @@ int main(int argc, char *argv[]) {
         if (pending_sleep) {
             pending_sleep = 0;
             info("Fan control disabled for sleep\n");
+            /* Deliberate exception to the invalid-temperature fail-safe:
+             * suspend hands thermal management to the EC's own automatic
+             * mode, which stays in charge while zcfan is not controlling. */
             if (write_fan_level("auto") == 0)
                 write_watchdog_timeout(0);
             fan_control_enabled = false;
@@ -1120,7 +1248,7 @@ int main(int argc, char *argv[]) {
              * startup debounce window; the next control tick engages a
              * level and writes it. */
             if (current_rule)
-                write_fan_level(current_rule->tpacpi_level);
+                write_fan_level(held_level());
             write_watchdog_timeout(watchdog_secs);
         }
     }

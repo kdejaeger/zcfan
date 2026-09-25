@@ -21,14 +21,18 @@ uses their arithmetic average for fan control. When identifiable CPU-core
 readings are available, only those readings are averaged. Otherwise, it uses
 CPU-labelled readings (or known CPU temperature drivers), and finally falls
 back to all readable temperature inputs, which can include die readings when
-no CPU sensor can be identified. Unavailable and non-positive readings are
-ignored. The set of readable, non-ignored temperature inputs is re-checked
+no CPU sensor can be identified. The preference follows readable readings,
+not discovered sensors: a discovered but unreadable preferred class falls
+through to the next one. Unavailable and non-positive readings are ignored.
+The set of readable, non-ignored temperature inputs is re-checked
 roughly once per second, so hwmon drivers that register after zcfan has started
 (for example, coretemp being autoloaded by udev during boot) are picked up
 automatically. The fan-control temperature is the maximum of the core average
-and the ACPI/EC sensor reading (the same reading the firmware's critical
-shutdown trip reacts to). Die/package sensor readings are deliberately
-excluded: they spike hotter and faster than the trip sensor. The ACPI/EC
+and the hottest CPU-level reading (the ACPI/EC sensor on most ThinkPads -- the
+reading the firmware's critical shutdown trip reacts to). Die/package sensor
+readings are deliberately excluded: they spike hotter and faster than the trip
+sensor, and only enter through the all-input fallback when no CPU-level
+reading is available. The ACPI/EC
 reading normally only raises the fan (engagement and the 95C panic, which
 also holds maximum): level reductions follow the core average, except when
 no genuine core average exists (then the fan-control temperature decides)
@@ -49,7 +53,7 @@ the trip temperature for the current fan state. In the 95C panic band no
 reduction is considered at all (maximum is held outright), and when no
 genuine core average is available the fan-control temperature decides
 instead (see above). This can be tuned with the config parameter
-`temp_hysteresis`.
+`temp_hysteresis` (accepted range 0 to 100; values outside it are rejected).
 
 To override these defaults, you can place a file at `/etc/zcfan.conf` with
 updated trip temperatures in degrees celsius and/or fan levels. As an example:
@@ -62,6 +66,15 @@ updated trip temperatures in degrees celsius and/or fan levels. As an example:
     max_level full-speed
     med_level 4
     low_level 1
+
+`max_level` `0` and `auto` are rejected at startup: they would command the
+fan off or hand control back to the EC exactly when the panic path or a
+runaway excursion needs the fan at its maximum. If `full-speed` is not
+supported by the kernel, a maximum of `full-speed` falls back to level 7;
+other explicitly configured maximum levels are kept as configured. The
+fail-safe for unreadable temperatures commands that same maximum level.
+The watchdog refresh interval can be tuned with `watchdog_secs` (accepted
+range 2 to 120 seconds, default 120).
 
 The number of consecutive seconds the fan-control temperature must stay above a
 level's trip temperature before that level is engaged can be set per level with
@@ -90,7 +103,17 @@ watchdog refreshes apart; failed writes do not consume the attempt
 budget, so a persistently failing write keeps retrying. If the fan
 still does not stop, zcfan logs an error and leaves it alone until the
 fan stops (or its speed can no longer be read), after which healing
-re-arms automatically.
+re-arms automatically. Healing is suspended while no valid temperature
+reading is available (the fail-safe then commands the configured maximum
+level, so a spinning fan is expected) and while the 95C panic band is
+active; it resumes with fresh confirmation once temperatures recover.
+At startup, zcfan exits instead of running blind when no readable
+temperature is found at all (the provided service units restart it
+automatically, so late-registering drivers and transient boot-time sensor
+failures self-heal). During suspend, zcfan deliberately hands control back
+to the EC (`auto`):
+the EC's own automatic mode is the thermal safety net while zcfan is not
+controlling, an explicit exception to the unreadable-temperature fail-safe.
 
 ### Ignoring sensors
 

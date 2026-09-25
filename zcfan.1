@@ -9,11 +9,16 @@ is a minimal, zero-configuration fan control daemon for ThinkPads. It uses
 an arithmetic average of available temperature readings for fan control. When
 CPU-core readings can be identified, only those are averaged; otherwise CPU
 readings are preferred, with a fallback to all readable temperature inputs
-(which can include die readings when no CPU sensor can be identified).
-The fan-control temperature is the maximum of the core average and the ACPI/EC
-sensor reading, the same reading the platform's critical-shutdown trip reacts
+(which can include die readings when no CPU sensor can be identified). The
+preference follows readable readings, not discovered sensors: a discovered
+but unreadable preferred class falls through to the next one.
+The fan-control temperature is the maximum of the core average and the hottest
+CPU-level reading (the ACPI/EC sensor on most ThinkPads), the reading the
+platform's critical-shutdown trip reacts
 to. Die/package readings are deliberately excluded: they spike hotter and
-faster than the trip sensor. The ACPI/EC reading normally only raises the fan
+faster than the trip sensor, and only enter through the all-input fallback
+when no CPU-level reading is available. The ACPI/EC reading normally only
+raises the fan
 (engagement and the 95C panic, which also holds maximum): level reductions
 follow the core average, except when no genuine core average exists (then
 the fan-control temperature decides) and in the 95C panic band (then no
@@ -90,7 +95,7 @@ We will only reduce the fan level again once:
 .IP "1." 3
 The core average is at least
 .I temp_hysteresis
-Celsius below the trip point (default 20C) -- no reduction is considered at
+Celsius below the trip point (default 20C, accepted range 0 to 100) -- no reduction is considered at
 all in the 95C panic band (maximum is held outright), and when no genuine
 core average is available the fan-control temperature decides instead (see
 the sensor description above), and
@@ -122,7 +127,7 @@ firmware's critical shutdown temperature.
 The kernel watchdog is reset every 120 seconds by default, but a
 smaller value can be selected in the
 .I /etc/zcfan.conf
-config file with the syntax
+config file with the syntax (accepted range 2 to 120 seconds)
 
 .RS
 .EX
@@ -132,7 +137,15 @@ watchdog_secs 10
 
 At each periodic watchdog refresh, zcfan also verifies that the EC has not
 reverted to its own automatic fan control, and re-asserts the held level if
-it has.
+it has. While no valid temperature reading is available at runtime, the
+fail-safe commands the configured maximum level and the re-assertion writes
+it as well; the runaway healing below is suspended in that state, and in
+the 95C panic band. (At startup, zcfan exits instead of running blind when
+no readable temperature is found at all; with the provided service units
+it is then restarted automatically.) During suspend, control is
+deliberately handed back to the EC
+(auto): the EC's own automatic mode is the thermal safety net while
+zcfan is not controlling, an explicit exception to that fail-safe.
 
 .SS SELF-RUNNING FANS
 On some dual-fan models the EC can get stuck running one fan at its own
@@ -147,7 +160,22 @@ watchdog refreshes apart; failed writes do not consume the attempt
 budget, so a persistently failing write keeps retrying. If the fan
 still does not stop, zcfan logs an error and leaves it alone until the
 fan stops (or its speed can no longer be read), after which healing
-re-arms automatically.
+re-arms automatically. Healing is suspended while no valid temperature
+reading is available: the fail-safe then commands the configured maximum
+level, so a spinning fan is expected, and healing resumes with fresh
+confirmation once readings recover.
+
+The configured maximum fan level must not be
+.I 0
+or
+.IR auto :
+such values are rejected at startup, because they would make the 95C panic
+path and the runaway excursion command the fan off or hand control back to
+the EC exactly when the machine is hottest. The unreadable-temperature
+fail-safe commands the same configured maximum level. If
+.I full-speed
+is not supported by the kernel, a maximum of full-speed falls back to
+level 7; other explicitly configured maxima are kept as configured.
 
 .SH DEPENDENCIES
 .B thinkpad-acpi

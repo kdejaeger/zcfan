@@ -9,6 +9,8 @@
 #undef main
 
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/wait.h>
 
 static int num_failures = 0;
 
@@ -128,6 +130,51 @@ static void read_stderr_log(const char *path, FILE *saved_stderr, char *line,
     char extra[4];
     expect(fgets(extra, (int)sizeof(extra), log) == NULL); /* one line only */
     expect(fclose(log) == 0);
+}
+
+/* Read a whole (small) file, e.g. the fan-control fixture, to assert the
+ * exact command the code under test last wrote. */
+static void read_text_file(const char *path, char *buf, size_t size) {
+    FILE *f = fopen(path, "re");
+    expect(f != NULL);
+    size_t n = fread(buf, 1, size - 1, f);
+    buf[n] = '\0';
+    expect(fclose(f) == 0);
+}
+
+/* Capture window that must stay silent: assert the captured stderr held
+ * nothing at all (read_stderr_log would FATAL on an empty window). */
+static void expect_stderr_empty(const char *path, FILE *saved_stderr) {
+    fflush(stderr);
+    expect(fclose(stderr) == 0);
+    stderr = saved_stderr;
+    FILE *log = fopen(path, "re");
+    expect(log != NULL);
+    expect(fgetc(log) == EOF);
+    expect(fclose(log) == 0);
+}
+
+/* get_config() exits on invalid directives, which cannot be asserted in
+ * this process: fork a child, run the parse there, and require exit
+ * status 1. The child's parse mutates only its own copy of the rules. */
+static void expect_config_status(const char *content, int expected_status) {
+    char config_file[640];
+    expect(snprintf(config_file, sizeof(config_file), "%s/parse-test.conf",
+                    fixture_root) > 0);
+    write_file(config_file, content);
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid == 0) {
+        expect(freopen("/dev/null", "w", stderr) != NULL);
+        config_path = config_file;
+        get_config();
+        _exit(0); /* unreachable for every rejected configuration */
+    }
+    expect(pid > 0);
+    int status;
+    expect(waitpid(pid, &status, 0) == pid);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == expected_status);
 }
 
 static void rm_rf(const char *path) {
@@ -300,9 +347,9 @@ int main(void) {
     CHECK(control_temp() == 68); /* die spikes at 99C ignored */
 
     /* With every averaged reading invalid (0) and die-labelled readings
-     * classified out, num_valid_temps == 0 while cores are still selected:
-     * the ACPI/EC sensor (60000) must be returned via the cpu_max path
-     * instead of erroring. */
+     * classified out, the core class yields no valid reading: the
+     * preference must fall through to the CPU class, whose ACPI/EC sensor
+     * (60000) provides the average instead of erroring. */
     expect(snprintf(path, sizeof(path), "%s/hwmon0/temp1_input", fixture_root) >
            0);
     write_file(path, "0");
@@ -317,15 +364,70 @@ int main(void) {
     write_file(path, "0");
     CHECK(control_temp() == 60); /* hwmon1's ACPI/EC sensor survives */
 
+    /* With the CPU-level reading invalid too, the preference must fall
+     * through to the readable ordinary sensors instead of reporting no
+     * valid temperature: the die-labelled readings dominate the fallback
+     * average, as documented for the no-CPU-sensor case. */
+    expect(snprintf(path, sizeof(path), "%s/hwmon1/temp1_input", fixture_root) >
+           0);
+    write_file(path, "0");
+    CHECK(control_temp() == 79); /* GPU 40 + nvme 41 + die 99x4, averaged */
+    /* Out-of-range sensor text must degrade to unreadable, not overflow:
+     * the nvme reading leaves the fallback average (87C without it). */
+    expect(snprintf(path, sizeof(path), "%s/hwmon2/temp1_input", fixture_root) >
+           0);
+    write_file(path, "99999999999999999999");
+    CHECK(control_temp() == 87); /* overflow reading rejected */
+    write_file(path, "-99999999999999999999");
+    CHECK(control_temp() == 87); /* negative overflow rejected too */
+    write_file(path, "41000");
+    expect(snprintf(path, sizeof(path), "%s/hwmon1/temp1_input", fixture_root) >
+           0);
+    write_file(path, "60000");
+    CHECK(control_temp() == 60); /* CPU-level reading preferred again */
+
     /* The 95C panic path engages maximum immediately, bypassing debounce:
      * from FAN_OFF with no debounce ticks accrued, the level still moves.
-     * (The fan write itself fails without thinkpad_acpi; ignored.) */
+     * The fan-control file is a fixture from here on, so level writes
+     * succeed and the recorded level genuinely advances. */
+    char fan_control_fixture[640];
+    expect(snprintf(fan_control_fixture, sizeof(fan_control_fixture),
+                    "%s/fan-control", fixture_root) > 0);
+    write_file(fan_control_fixture, "");
+    fan_control_file = fan_control_fixture;
     expect(snprintf(path, sizeof(path), "%s/hwmon1/temp1_input", fixture_root) >
            0);
     write_file(path, "95000");
     current_rule = rules + FAN_OFF;
     CHECK(set_fan_level() == FAN_LEVEL_SET);
     CHECK(current_rule == rules + FAN_MAX);
+
+    /* The recorded level must advance only on a successful write: a failed
+     * panic write leaves the old rule in place so the next tick retries
+     * instead of assuming maximum is already on the wire. */
+    fan_control_file = "/nonexistent-zcfan-fan-control";
+    write_file(path, "96000"); /* path: hwmon1/temp1_input */
+    current_rule = rules + FAN_OFF;
+    CHECK(set_fan_level() == FAN_LEVEL_NOT_SET); /* failed write: retryable */
+    CHECK(current_rule == rules + FAN_OFF);
+    fan_control_file = fan_control_fixture;
+    CHECK(set_fan_level() == FAN_LEVEL_SET); /* retried on the next tick */
+    CHECK(current_rule == rules + FAN_MAX);
+
+    /* Same guard for ordinary (non-panic) engagement: a failed reduction
+     * write leaves the recorded level alone so the next tick retries. */
+    fan_control_file = "/nonexistent-zcfan-fan-control";
+    make_temp("hwmon0", "temp2_input", NULL, 45000);
+    make_temp("hwmon0", "temp3_input", NULL, 47000);
+    make_temp("hwmon0", "temp4_input", NULL, 49000);
+    make_temp("hwmon1", "temp1_input", NULL, 65000);
+    for (int i = 0; i < 3; i++) {
+        CHECK(set_fan_level() == FAN_LEVEL_NOT_SET); /* hold, then fail */
+        CHECK(current_rule == rules + FAN_MAX);
+    }
+    fan_control_file = fan_control_fixture;
+    CHECK(set_fan_level() == FAN_LEVEL_SET); /* retried and engaged */
+    CHECK(current_rule == rules + FAN_OFF);
 
     /* A NULL current_rule (first ticks still waiting out a debounce on a
      * hot start) must not abort in the watchdog path. */
@@ -527,6 +629,12 @@ int main(void) {
     char log_path[640];
     expect(snprintf(log_path, sizeof(log_path), "%s/fan-log", fixture_root) >
            0);
+    /* stderr capture buffers, shared by the runaway and fail-safe tests */
+    char err_path[640];
+    char err_line[256];
+    expect(snprintf(err_path, sizeof(err_path), "%s/err-log", fixture_root) >
+           0);
+    FILE *saved_err;
 
     /* Core-driven reduction: medium to low on a 55C core average while the
      * EC reading holds at 85C. The first two calls drain the freshly
@@ -621,6 +729,30 @@ int main(void) {
     rules[FAN_MAX].threshold = 90;
     config_path = CONFIG_PATH;
 
+    /* Config safety validation must reject dangerous directives at
+     * startup (the child's exit status proves the parse exits). */
+    expect_config_status("max_level 0\n", 1);
+    expect_config_status("max_level auto\n", 1);
+    expect_config_status("temp_hysteresis -1\n", 1);
+    expect_config_status("temp_hysteresis 101\n", 1);
+    expect_config_status("watchdog_secs 1\n", 1);
+    expect_config_status("watchdog_secs 121\n", 1);
+    expect_config_status("watchdog_secs 120\nmax_temp 85\nmax_level 7\n"
+                         "temp_hysteresis 100\n",
+                         0);
+
+    /* The trajectory's last tick sat in the 95C panic band; the runaway
+     * module below drives the watchdog path directly (no set_fan_level()
+     * in between), so leave the state it reads -- panic/fail-safe flags,
+     * held rule, hold ticks -- quiet via one ordinary control tick. */
+    make_temp("hwmon1", "temp1_input", NULL, 45000);
+    CHECK(set_fan_level() == FAN_LEVEL_SET); /* steps down to off */
+    CHECK(current_rule == rules + FAN_OFF);
+    CHECK(set_fan_level() == FAN_LEVEL_NOT_SET); /* off holds */
+    /* The runaway module's first phase exercises failing writes: put the
+     * default (unwritable) fan-control file back. */
+    fan_control_file = FAN_CONTROL_FILE;
+
     /* --- Per-fan runaway detection and healing ---
      *
      * The runaway is detected while the off level is held: a fan input
@@ -663,15 +795,11 @@ int main(void) {
         CHECK(maybe_fix_runaway_fan() == false); /* drain the backoff */
     }
 
-    /* Success path: point the fan-control file at a fixture file so the
+    /* Success path: point the fan-control file at the fixture file so the
      * excursion write succeeds. The excursion consumes attempt 1, waits
      * out the retry spacing, consumes attempt 2; the third consumes the
      * last attempt, and the refresh after it exhausts the episode: one
      * stderr abandonment line, then holding. */
-    char fan_control_fixture[640];
-    expect(snprintf(fan_control_fixture, sizeof(fan_control_fixture),
-                    "%s/fan-control", fixture_root) > 0);
-    write_file(fan_control_fixture, "");
     fan_control_file = fan_control_fixture;
     saved_stdout = capture_fan_log(log_path);
     CHECK(maybe_fix_runaway_fan() == true); /* excursion 1 */
@@ -689,11 +817,7 @@ int main(void) {
     CHECK(maybe_fix_runaway_fan() == true); /* excursion 3: budget spent */
     /* The refresh after the last excursion exhausts the episode: no
      * excursion, one abandonment line on stderr, then holding. */
-    char err_path[640];
-    char err_line[256];
-    expect(snprintf(err_path, sizeof(err_path), "%s/err-log", fixture_root) >
-           0);
-    FILE *saved_err = capture_stderr_log(err_path);
+    saved_err = capture_stderr_log(err_path);
     CHECK(maybe_fix_runaway_fan() == false);
     read_stderr_log(err_path, saved_err, err_line, sizeof(err_line));
     CHECK(strstr(err_line,
@@ -719,11 +843,165 @@ int main(void) {
     current_rule = rules + FAN_OFF;
     CHECK(maybe_fix_runaway_fan() == false); /* confirms again (m4) */
     CHECK(maybe_fix_runaway_fan() == true);  /* fresh excursion 1 */
+    /* The excursion is invisible in the file (each write truncates it),
+     * but the restore write is not: the held level must be back on the
+     * wire after a successful excursion. */
+    char content[64];
+    read_text_file(fan_control_fixture, content, sizeof(content));
+    CHECK(strcmp(content, "level 0") == 0);
+
+    /* The invalid-temperature fail-safe must not be fought by healing or
+     * by the held-level reassertions: with every temperature unreadable
+     * the daemon commands full-speed, a spinning fan under that command is
+     * not a runaway, and rewriting the held off level over the fail-safe
+     * would undo it. */
+    make_temp("hwmon0", "temp1_input", NULL, 0);
+    make_temp("hwmon0", "temp2_input", NULL, 0);
+    make_temp("hwmon0", "temp3_input", NULL, 0);
+    make_temp("hwmon0", "temp4_input", NULL, 0);
+    make_temp("hwmon0", "temp5_input", NULL, 0);
+    make_temp("hwmon0", "temp6_input", NULL, 0);
+    make_temp("hwmon1", "temp1_input", NULL, 0);
+    make_temp("hwmon1", "temp2_input", NULL, 0);
+    make_temp("hwmon1", "temp3_input", NULL, 0);
+    make_temp("hwmon1", "temp4_input", NULL, 0);
+    make_temp("hwmon2", "temp1_input", NULL, 0);
+    /* The outage diagnostic is rate-limited: the transition into the
+     * outage logs exactly once, a repeat outage tick is silent. */
+    saved_err = capture_stderr_log(err_path);
+    CHECK(set_fan_level() == FAN_LEVEL_INVALID); /* fail-safe engaged */
+    read_stderr_log(err_path, saved_err, err_line, sizeof(err_line));
+    CHECK(strstr(err_line, "Couldn't find any valid temperature") != NULL);
+    saved_err = capture_stderr_log(err_path);
+    CHECK(set_fan_level() == FAN_LEVEL_INVALID); /* repeat tick */
+    expect_stderr_empty(err_path, saved_err);    /* rate-limited */
+    read_text_file(fan_control_fixture, content, sizeof(content));
+    CHECK(strcmp(content, "level full-speed") == 0);
+    /* A watchdog refresh under the fail-safe: the status reassertion (the
+     * EC reads "enabled") must re-write the fail-safe level, not the held
+     * off level, and healing must stay suspended and silent. */
+    write_file(fan_control_fixture, "status: enabled\n");
+    saved_err = capture_stderr_log(err_path);
+    reassert_fan_control();
+    expect_stderr_empty(err_path, saved_err);
+    read_text_file(fan_control_fixture, content, sizeof(content));
+    CHECK(strcmp(content, "level full-speed") == 0);
+    /* Temps recover while the fan-control file is unwritable: the restore
+     * fails, the fail-safe must stay active (the next tick retries instead
+     * of trusting bookkeeping that no longer matches the wire), and once
+     * the file is writable again the held level is re-written. */
+    make_temp("hwmon0", "temp2_input", NULL, 52000);
+    make_temp("hwmon0", "temp3_input", NULL, 55000);
+    make_temp("hwmon0", "temp4_input", NULL, 58000);
+    make_temp("hwmon1", "temp1_input", NULL, 45000);
+    fan_control_file = "/nonexistent-zcfan-fan-control";
+    CHECK(set_fan_level() == FAN_LEVEL_NOT_SET); /* restore failed */
+    read_text_file(fan_control_fixture, content, sizeof(content));
+    CHECK(strcmp(content, "level full-speed") == 0); /* wire untouched */
+    CHECK(set_fan_level() == FAN_LEVEL_NOT_SET);     /* retried, failed again */
+    fan_control_file = fan_control_fixture;
+    CHECK(set_fan_level() == FAN_LEVEL_NOT_SET); /* off held again */
+    read_text_file(fan_control_fixture, content, sizeof(content));
+    CHECK(strcmp(content, "level 0") == 0);  /* held level re-written */
+    CHECK(maybe_fix_runaway_fan() == false); /* fresh confirmation 1 */
+    CHECK(maybe_fix_runaway_fan() == true);  /* fresh excursion 1 */
+    read_text_file(fan_control_fixture, content, sizeof(content));
+    CHECK(strcmp(content, "level 0") == 0);
+
+    /* Recovery in the panic band must not command the held off level: the
+     * recovered temperature already demands the maximum, so the panic
+     * write takes the wire directly. */
+    make_temp("hwmon0", "temp2_input", NULL, 0);
+    make_temp("hwmon0", "temp3_input", NULL, 0);
+    make_temp("hwmon0", "temp4_input", NULL, 0);
+    make_temp("hwmon1", "temp1_input", NULL, 0);
+    make_temp("hwmon2", "temp1_input", NULL, 0);
+    /* Recovery reset the outage diagnostic: the new outage logs again. */
+    saved_err = capture_stderr_log(err_path);
+    CHECK(set_fan_level() == FAN_LEVEL_INVALID); /* fail-safe re-engaged */
+    read_stderr_log(err_path, saved_err, err_line, sizeof(err_line));
+    CHECK(strstr(err_line, "Couldn't find any valid temperature") != NULL);
+    read_text_file(fan_control_fixture, content, sizeof(content));
+    CHECK(strcmp(content, "level full-speed") == 0);
+    make_temp("hwmon0", "temp2_input", NULL, 45000);
+    make_temp("hwmon0", "temp3_input", NULL, 47000);
+    make_temp("hwmon0", "temp4_input", NULL, 49000);
+    make_temp("hwmon1", "temp1_input", NULL, 96000);
+    CHECK(set_fan_level() == FAN_LEVEL_SET); /* panic, no off in between */
+    CHECK(current_rule == rules + FAN_MAX);
+    read_text_file(fan_control_fixture, content, sizeof(content));
+    CHECK(strcmp(content, "level full-speed") == 0);
+    /* Healing stays suspended in the panic band even when a failed panic
+     * write leaves the bookkeeping at off: no excursion, silent. */
+    fan_control_file = "/nonexistent-zcfan-fan-control";
+    current_rule = rules + FAN_OFF;
+    CHECK(set_fan_level() == FAN_LEVEL_NOT_SET); /* panic write failed */
+    CHECK(current_rule == rules + FAN_OFF);
+    saved_err = capture_stderr_log(err_path);
+    CHECK(maybe_fix_runaway_fan() == false); /* panic gate: suspended */
+    CHECK(maybe_fix_runaway_fan() == false);
+    expect_stderr_empty(err_path, saved_err);
+    fan_control_file = fan_control_fixture;
+    CHECK(set_fan_level() == FAN_LEVEL_SET); /* panic retried */
+    CHECK(current_rule == rules + FAN_MAX);
+    /* Settle back to off for the fan-at-rest test that follows. */
+    make_temp("hwmon1", "temp1_input", NULL, 45000);
+    {
+        const struct Rule *settle_path[] = {
+            rules + FAN_MAX, rules + FAN_MAX, rules + FAN_OFF,
+            rules + FAN_OFF, rules + FAN_OFF,
+        };
+        for (int i = 0; i < 5; i++) {
+            const struct Rule *before = current_rule;
+            enum set_fan_status st = set_fan_level();
+            CHECK(current_rule == settle_path[i]);
+            CHECK(st ==
+                  (current_rule != before ? FAN_LEVEL_SET : FAN_LEVEL_NOT_SET));
+        }
+    }
+    read_text_file(fan_control_fixture, content, sizeof(content));
+    CHECK(strcmp(content, "level 0") == 0);
 
     /* A fan at rest never triggers anything. */
     make_temp("hwmon1", "fan1_input", NULL, 0);
     CHECK(maybe_fix_runaway_fan() == false);
     CHECK(maybe_fix_runaway_fan() == false);
+
+    /* An out-of-range RPM reading must degrade to unreadable: the gate
+     * sees a stopped fan and resets, silently, instead of attempting an
+     * excursion on garbage. (Placed after the at-rest reset so it does
+     * not clobber the confirmation state the success path relied on.) */
+    expect(snprintf(path, sizeof(path), "%s/hwmon1/fan1_input", fixture_root) >
+           0);
+    write_file(path, "99999999999999999999");
+    saved_err = capture_stderr_log(err_path);
+    CHECK(maybe_fix_runaway_fan() == false);
+    CHECK(maybe_fix_runaway_fan() == false);
+    expect_stderr_empty(err_path, saved_err);
+    make_temp("hwmon1", "fan1_input", NULL, 2500);
+
+    /* A suspend signal interrupting the excursion pause must not skip the
+     * restore, and must not spend the full second: the interrupted pause
+     * breaks early once pending_sleep is observed. SIGALRM reuses the
+     * SIGPWR handler (both just set pending_sleep); the timer is armed
+     * after the confirmation-only refresh so it fires inside the sleep. */
+    make_temp("hwmon1", "fan1_input", NULL, 2500);
+    CHECK(maybe_fix_runaway_fan() == false); /* confirm only */
+    const struct sigaction pausing = {.sa_handler = handle_sigpwr};
+    const struct sigaction sigalrm_old = {.sa_handler = SIG_DFL};
+    expect(sigaction(SIGALRM, &pausing, NULL) == 0);
+    struct itimerval timer = {0};
+    timer.it_value.tv_usec = 50000; /* interrupt the pause at 50ms */
+    expect(setitimer(ITIMER_REAL, &timer, NULL) == 0);
+    struct timespec pause_start, pause_end;
+    expect(clock_gettime(CLOCK_MONOTONIC, &pause_start) == 0);
+    CHECK(maybe_fix_runaway_fan() == true); /* excursion, pause broken */
+    expect(clock_gettime(CLOCK_MONOTONIC, &pause_end) == 0);
+    CHECK(pause_end.tv_sec - pause_start.tv_sec < 1); /* not a full second */
+    expect(sigaction(SIGALRM, &sigalrm_old, NULL) == 0);
+    pending_sleep = 0;
+    read_text_file(fan_control_fixture, content, sizeof(content));
+    CHECK(strcmp(content, "level 0") == 0); /* restored despite the signal */
 
     fan_control_file = FAN_CONTROL_FILE;
     close_sensor_fds(&sensor_set);
