@@ -3,3 +3,4 @@ zcfan.service
 tests/test-runner
 .idea
 .pi
+tmp
